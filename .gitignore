@@ -6,6 +6,7 @@ __pycache__/
 # C extensions
 *.so
 
+
 # Distribution / packaging
 .Python
 build/
@@ -14,6 +15,8 @@ dist/
 downloads/
 eggs/
 .eggs/
+# Local virtualenv site-packages directories (commonly created by virtualenv/venv).
+# Ignore these to avoid committing installed packages from a developer's environment.
 lib/
 lib64/
 parts/
@@ -143,6 +146,10 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+# Project-specific Python environment directory used for audio experiments.
+# Contains installed packages and binaries; ignore to avoid committing environment files.
+audio_env/
+
 
 # Spyder project settings
 .spyderproject
