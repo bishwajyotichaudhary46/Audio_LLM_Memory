@@ -1,1 +1,8 @@
+ipykernel
+torch
+torchvision
+pandas
+transformers
+datasets
+librosa
 -e .
