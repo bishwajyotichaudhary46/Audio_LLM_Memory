@@ -9,6 +9,7 @@ __pycache__/
 # artifacts
 Data/
 whisper-small-nep/
+whisper-small-memory/
 
 
 # Distribution / packaging

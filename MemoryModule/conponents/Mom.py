@@ -28,12 +28,14 @@ class MOM(nn.Module):
         # Router
         self.router = nn.Linear(n_text_state, num_memories)
 
+        # Bias Initialization
+        self.register_buffer("bias", torch.zeros(32, num_memories))
+
         # Create a LinearAttention module per memory slot
         self.mult_mem = nn.ModuleList(
             [LinearAttentionMem(n_text_state=self.n_text_state,
                                 n_heads= self.n_heads) for _ in range(num_memories)]
         )
-
         self.softmax = nn.Softmax(dim=-1)
 
     def split_head(self, t):
@@ -49,8 +51,10 @@ class MOM(nn.Module):
         """
         B, S, _,_ = t.shape
         return t.view(B, S, self.n_heads*self.n_text_state)
+    
 
-    def forward(self, x, M,bias):
+
+    def forward(self, x):
         """
         x: [B, S, n_text_state]
         M: [B, H*NumMem, K, V]
@@ -65,9 +69,9 @@ class MOM(nn.Module):
 
         # Router
         router_weight = self.router(x)                          # [B, S, num_memories]
-        routing_weight, bias = self.bias_term_adjust(router_weight,
+        routing_weight, self.bias[:B] = self.bias_term_adjust(router_weight,
                                                      self.softmax,
-                                                     avg_load_per_expert, self.num_memories, bias)
+                                                     avg_load_per_expert, self.num_memories, self.bias[:B])
 
         # M emory Temp
         memory_outputs = []
@@ -75,16 +79,11 @@ class MOM(nn.Module):
         # Run selected memory modules only
         for mem_id in range(self.num_memories):
             # Extract prev mem for this memory: [B,H,K,V]
-            M_t = M[:,mem_id*self.n_heads:(mem_id+1)*self.n_heads, :,:]
-
+            # M_t = M[:B,mem_id*self.n_heads:(mem_id+1)*self.n_heads, :,:]
             # Call attention module
-            M_t = self.mult_mem[mem_id](x, M_t, routing_weight, mem_id)
-
-            # Update in Mix Memory
-            M[:,mem_id*self.n_heads:(mem_id+1)*self.n_heads, :,:] = M_t
+            M_t = self.mult_mem[mem_id](x,routing_weight, mem_id)
 
             memory_outputs.append(M_t)
-
 
 
         # Sum all memory contributions
@@ -96,7 +95,6 @@ class MOM(nn.Module):
             o[:, t] = torch.einsum('b h k v, b h d -> b h v', final_memory, q[:, t])
 
 
-
         # Final output projection
         final_output = self.W(self.mixed_head(o))
 
@@ -105,4 +103,4 @@ class MOM(nn.Module):
         # final_output = final_output.view(B, S, H * D)
         # final_output = self.atten_out_proj(final_output)
 
-        return bias, M, final_output
+        return final_output

@@ -1,4 +1,5 @@
 import torch
+@torch.no_grad()
 def bias_term_adjust(router_weight, softmax, avg_load_per_expert, num_memories, bias, u=0.001):
     """
     router_weight: [B, S, E]   (E = num_memories)

@@ -15,6 +15,10 @@ class LinearAttentionMem(nn.Module):
         # Projections
         self.keys_proj   = nn.Linear(n_text_state, self.n_text_state * n_heads, bias=bias)
         self.values_proj = nn.Linear(n_text_state, self.n_text_state * n_heads, bias=bias)
+        
+
+        # Memory Initialization
+        self.register_buffer("M", torch.zeros(32, n_heads, n_text_state, n_text_state))
 
         # foget Projections
         self.forget = nn.Linear(n_text_state, self.n_heads )
@@ -25,7 +29,7 @@ class LinearAttentionMem(nn.Module):
         return x.view(B, S, self.n_heads, self.n_text_state)
 
 
-    def forward(self, x: torch.Tensor, M: torch.Tensor, router_weight: torch.Tensor, Mem_id):
+    def forward(self, x: torch.Tensor, router_weight: torch.Tensor, Mem_id):
         """
         Args:
             x     : [B, S, n_text_state]     current input chunk
@@ -47,18 +51,18 @@ class LinearAttentionMem(nn.Module):
         k = self._split_heads(k)                        # [B, S, H, D]
         v = self._split_heads(v)                        # [B, S, H, D]
 
+        # Compute Forget
+        forget = torch.sigmoid(self.forget(x))
 
         # Linear Attention Update
         for t in range(S):
-            # Compute Forget
-            forget = torch.sigmoid(self.forget(x))
-
             # Compute Memories Weight
             memory_weight = router_weight[:,t,Mem_id, None, None,None]
 
             # Update memory M
-            M = forget[:,t,:, None, None]*M + memory_weight * torch.einsum('b h k, b h v -> b h k v', k[:, t], v[:, t])
+            with torch.no_grad():
+                self.M[:B] = forget[:,t,:, None, None]*self.M[:B] + memory_weight * torch.einsum('b h k, b h v -> b h k v', k[:, t], v[:, t])
             # Compute output at time t
             # o[:, t] = torch.einsum('b h k v, b h k -> b h v', M, q[:, t])
 
-        return M
+        return self.M[:B]

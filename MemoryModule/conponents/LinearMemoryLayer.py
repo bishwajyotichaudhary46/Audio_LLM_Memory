@@ -6,7 +6,7 @@ import transformers
 from MemoryModule.conponents.Mom import MOM
 from MemoryModule.conponents.MHARouting import MHARouting
 
-class WhisperDecoderMemoryLayer(WhisperDecoderLayer):
+class WhisperMemoryLayer(WhisperDecoderLayer):
     def __init__(
         self,
         config,
@@ -27,6 +27,7 @@ class WhisperDecoderMemoryLayer(WhisperDecoderLayer):
             num_memories=num_memories,
             bias_term_adjust=bias_term_adjust,
             LinearAttentionMem=LinearAttentionMem,
+            
         )
         self.memory_norm = nn.LayerNorm(config.d_model)
 
@@ -41,17 +42,20 @@ class WhisperDecoderMemoryLayer(WhisperDecoderLayer):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         cross_attn_layer_head_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[transformers.cache_utils.EncoderDecoderCache] = None,
+        past_key_value: Optional[transformers.cache_utils.EncoderDecoderCache] = None,
         output_attentions: bool = False,
         use_cache: bool = True,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Tuple[Any, ...]:
-        hidden_states = hidden_states.unsqueeze(0)
+        
+        
+        print("entering memory layer")
         residual = hidden_states
-        B = hidden_states.size(0)
-
-        # Initialize M/bias ONLY on first pass in memory layer (layer 0)
-        if self.is_memory_layer and is_first_pass and M is None:
+       # print("hidden state", hidden_states)
+        print("M is initiled or nor", M is None)
+        # Initialize M/bias ONLY on first pass in memory layer
+        if self.is_memory_layer and M is None:
+            B = hidden_states.shape[0]
             M = torch.zeros((
                 B,
                 self.num_memories * self.config.decoder_attention_heads,
@@ -64,36 +68,42 @@ class WhisperDecoderMemoryLayer(WhisperDecoderLayer):
                 device=hidden_states.device,
                 dtype=hidden_states.dtype,
             )
+            print("Memory Iniitalized ", M.shape, bias.shape)
+
         
-        #print("hidden state ", hidden_states.shape)
+        #print("starting self attention:")
         # Self-attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            past_key_value=past_key_values,
+            past_key_value=past_key_value,
             output_attentions=output_attentions,
-            use_cache=use_cache,
             cache_position=cache_position,
         )
+
+        print("self attention done!")
 
         #print("hidden state ", hidden_states.shape)
         hidden_states = self.self_attn_layer_norm(residual + hidden_states)
 
-        #print("hidden state ", hidden_states.shape)
-
-        # Routing gate
-        atten_gate = self.attn_route(hidden_states)  # [B, T, 1]
-
+       
         # Memory fusion
         if self.is_memory_layer:
+            print("attention route ", hidden_states.shape)
+
+            # Routing gate
+            atten_gate = self.attn_route(hidden_states)  # [B, T, 1]
+            print("attn gate:", atten_gate.shape)
+
             # Update via MOM
             bias, M, mem_out = self.context_mom(hidden_states, M, bias)
             M = self.memory_norm(M)
             hidden_states = hidden_states + atten_gate * mem_out
+            print("Memory Updated", M.shape)
         else:
             # Read-only
             hidden_states = hidden_states
-        
+        #print("Memory Fusion Done!", hidden_states.shape)
         # Cross-attention
         cross_attn_weights = None
         cross_attn_present_key_value = None
@@ -104,23 +114,26 @@ class WhisperDecoderMemoryLayer(WhisperDecoderLayer):
                 key_value_states=encoder_hidden_states,
                 attention_mask=encoder_attention_mask,
                 layer_head_mask=cross_attn_layer_head_mask,
-                past_key_value=past_key_values.cross_attention if past_key_values else None,
+                past_key_value=past_key_value.cross_attention if past_key_value else None,
                 output_attentions=output_attentions,
-                use_cache=use_cache,
                 cache_position=cache_position,
             )
             hidden_states = self.encoder_attn_layer_norm(residual + hidden_states)
+
+        #print("cross attention done", hidden_states.shape)
 
         # Feed Forward Network
         residual = hidden_states
         hidden_states = self.fc2(self.activation_fn(self.fc1(hidden_states)))
         hidden_states = self.final_layer_norm(residual + hidden_states)
-
+         
+        # print("ffn done", hidden_states.shape)
         # Outputs
         outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights, cross_attn_weights)
-        if use_cache:
-            outputs += (present_key_value,)
-
-        return outputs + (M, bias)
+        # if use_cache:
+        #     outputs += (present_key_value,)
+        print("ok")
+ 
+        return outputs,  M,  bias
