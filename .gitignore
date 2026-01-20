@@ -10,6 +10,8 @@ __pycache__/
 Data/
 whisper-small-nep/
 whisper-small-memory/
+whisper-small-mem-nep/
+trained_check_point/
 
 
 # Distribution / packaging

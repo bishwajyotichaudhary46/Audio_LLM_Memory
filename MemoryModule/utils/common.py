@@ -40,7 +40,10 @@ def bias_term_adjust(router_weight, softmax, avg_load_per_expert, num_memories, 
 
     # Apply router weight update (vectorized)
     # router_weight[:,:,idx] += load * bias[:,idx]
-    router_weight = router_weight + direction.unsqueeze(0).unsqueeze(0) * bias
+    # print("direction",direction.shape)
+    # print("bias",bias.shape)
+    # print("router", router_weight.shape)
+    router_weight + (bias*direction).unsqueeze(1)
 
     # Bias update like gradient descent
     # bias = bias + u * load_signal

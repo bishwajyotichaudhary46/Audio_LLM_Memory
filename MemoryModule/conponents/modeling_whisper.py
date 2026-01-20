@@ -9,7 +9,10 @@ from transformers.cache_utils import EncoderDecoderCache
 from transformers.models.whisper.modeling_whisper import WhisperPreTrainedModel,WhisperDecoder, WhisperGenerationMixin,_compute_mask_indices, WhisperForConditionalGeneration
 from transformers.models.whisper.modeling_whisper import WhisperAttention, WhisperModel,WhisperDecoderLayer, shift_tokens_right, WhisperPositionalEmbedding,WhisperEncoder,CausalLMOutputWithCrossAttentions
 
-
+from transformers.modeling_flash_attention_utils import (
+    FlashAttentionKwargs
+)
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from torch.nn import CrossEntropyLoss
 from MemoryModule.utils import auto_docsting
 from typing import Union, Optional
@@ -24,36 +27,216 @@ from transformers.utils.doc import (
     add_start_docstrings_to_model_forward,
     replace_return_docstrings,
 )
-from MemoryModule.utils.mask_utils import create_causal_mask
+
 from MemoryModule.conponents.Mom import MOM
 from MemoryModule.conponents.MHARouting import MHARouting
 from MemoryModule.conponents.LinearAttention import LinearAttentionMem
 from MemoryModule.utils.common import bias_term_adjust
+from MemoryModule.utils.masking_utils import create_causal_mask
+from transformers.utils import logging
+from collections.abc import Callable
+from transformers.processing_utils import Unpack
 
+logger = logging.get_logger(__name__)
+
+_HIDDEN_STATES_START_POSITION = 1
+
+def eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: Optional[float] = None,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    if scaling is None:
+        scaling = query.size(-1) ** -0.5
+
+    attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
+    if attention_mask is not None and attention_mask.ndim == 4:
+        attn_weights = attn_weights + attention_mask[:, :, :, : key.shape[-2]]
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
+class WhisperAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        is_decoder: bool = False,
+        bias: bool = True,
+        is_causal: bool = False,
+        layer_idx: Optional[int] = None,
+        config: Optional[WhisperConfig] = None,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.head_dim = embed_dim // num_heads
+        self.config = config
+
+        if (self.head_dim * num_heads) != self.embed_dim:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
+                f" and `num_heads`: {num_heads})."
+            )
+        self.scaling = self.head_dim**-0.5
+        self.is_decoder = is_decoder
+        self.is_causal = is_causal
+
+        if layer_idx is None and is_decoder:
+            logger.warning_once(
+                f"Instantiating a decoder {self.__class__.__name__} without passing `layer_idx` is not recommended and "
+                "will to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )
+        self.layer_idx = layer_idx
+
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        key_value_states: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+        cache_position: Optional[torch.Tensor] = None,
+        # TODO: we need a refactor so that the different attention modules can get their specific kwargs
+        # ATM, we have mixed things encoder, decoder, and encoder-decoder attn
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+        """Input shape: Batch x Time x Channel"""
+
+        # if key_value_states are provided this layer is used as a cross-attention layer
+        # for the decoder
+        is_cross_attention = key_value_states is not None
+
+        # determine input shapes
+        bsz, tgt_len = hidden_states.shape[:-1]
+        q_input_shape = (bsz, tgt_len, -1, self.head_dim)
+
+        # Scaling is susceptible to floating point arithmetics' inprecisions
+        # which can lead to different results (this is dependent from model
+        # to model, e.g. whisper is one such case). We therefore keep the
+        # original order of scaling to follow the original implementation
+        # and enforce no scaling (1.0) in the attention call below.
+        query_states = self.q_proj(hidden_states) * self.scaling
+        query_states = query_states.view(*q_input_shape)
+        query_states = query_states.transpose(1, 2).contiguous()
+
+        # Check is encoder-decoder model is being used. Otherwise we'll get `DynamicCache`
+        if past_key_values is not None and isinstance(past_key_values, EncoderDecoderCache):
+            is_updated = past_key_values.is_updated.get(self.layer_idx)
+            if is_cross_attention:
+                # after the first generated id, we can subsequently re-use all key/value_states from cache
+                past_key_values.is_updated[self.layer_idx] = True
+                past_key_values = past_key_values.cross_attention_cache
+            else:
+                past_key_values = past_key_values.self_attention_cache
+
+        # use key_value_states if cross attention
+        current_states = key_value_states if key_value_states is not None else hidden_states
+        if is_cross_attention and past_key_values and is_updated:
+            # reuse k,v, cross_attentions
+            new_key_values = past_key_values.to_legacy_cache()
+
+            key_states, value_states = new_key_values[self.layer_idx]
+
+            # layer_cache = past_key_values.get_layer(self.layer_idx)
+            # key_states = layer_cache.self_attention.key
+            # value_states = layer_cache.self_attention.values
+
+            # key_states = past_key_values[self.layer_idx].keys
+            # value_states = past_key_values[self.layer_idx].values
+        else:
+            key_states = self.k_proj(current_states).view(bsz, -1, self.num_heads, self.head_dim)
+            value_states = self.v_proj(current_states).view(bsz, -1, self.num_heads, self.head_dim)
+            key_states = key_states.transpose(1, 2).contiguous()
+            value_states = value_states.transpose(1, 2).contiguous()
+            if past_key_values is not None:
+                # save all key/value_states to cache to be re-used for fast auto-regressive generation
+                cache_position = cache_position if not is_cross_attention else None
+                key_states, value_states = past_key_values.update(
+                    key_states, value_states, self.layer_idx, {"cache_position": cache_position}
+                )
+
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.dropout,
+            scaling=1.0,
+            output_attentions=output_attentions,
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(bsz, tgt_len, -1).contiguous()
+        attn_output = self.out_proj(attn_output)
+
+        return attn_output, attn_weights
 class DecoderLayer(WhisperDecoderLayer):
 
     def __init__(self, config: WhisperConfig, 
         layer_idx: Optional[int] = None, 
-        num_memories: int = 8,
-        bias_term_adjust: Any = None,
-        LinearAttentionMem: Any = None,
-        is_memory_layer: bool = False,):
+        ):
+        # num_memories: int = 8,
+        # bias_term_adjust: Any = None,
+        # LinearAttentionMem: Any = None,
+        # is_memory_layer: bool = False,
 
         super().__init__(config, layer_idx)
-        self.is_memory_layer = is_memory_layer
-        self.num_memories = num_memories
-        self.config = config
-
-        self.attn_route = MHARouting(config.d_model)
-        self.context_mom = MOM(
-            n_text_state=config.d_model,
-            n_heads=config.decoder_attention_heads,
-            num_memories=num_memories,
-            bias_term_adjust=bias_term_adjust,
-            LinearAttentionMem=LinearAttentionMem,
-            
+        self.self_attn = WhisperAttention(
+            embed_dim=self.embed_dim,
+            num_heads=config.decoder_attention_heads,
+            dropout=config.attention_dropout,
+            is_decoder=True,
+            is_causal=True,
+            layer_idx=layer_idx,
+            config=config,
         )
-        self.memory_norm = nn.LayerNorm(config.d_model)
+        self.encoder_attn = WhisperAttention(
+            self.embed_dim,
+            config.decoder_attention_heads,
+            dropout=config.attention_dropout,
+            is_decoder=True,
+            layer_idx=layer_idx,
+            config=config,
+        )
+        # self.is_memory_layer = is_memory_layer
+        # self.num_memories = num_memories
+        # self.config = config
+
+        # self.attn_route = MHARouting(config.d_model)
+        # self.context_mom = MOM(
+        #     n_text_state=config.d_model,
+        #     n_heads=config.decoder_attention_heads,
+        #     num_memories=num_memories,
+        #     bias_term_adjust=bias_term_adjust,
+        #     LinearAttentionMem=LinearAttentionMem,
+            
+        # )
+        # self.memory_norm = nn.LayerNorm(config.d_model)
         
         
     def forward(
@@ -66,6 +249,7 @@ class DecoderLayer(WhisperDecoderLayer):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = True,
         cache_position: Optional[torch.LongTensor] = None,
+        
 
     ) -> torch.Tensor:
         """
@@ -104,29 +288,30 @@ class DecoderLayer(WhisperDecoderLayer):
 
 
         # Self Attention
-        hidden_states, self_attn_weights, _ = self.self_attn(
+        hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
+            past_key_values = past_key_values,
             output_attentions=output_attentions,
             cache_position=cache_position,
         )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         # Memory fusion
-        if self.is_memory_layer:
-            # print("attention route ", hidden_states.shape)
+        # if self.is_memory_layer:
+        #     # print("attention route ", hidden_states.shape)
 
-            # Routing gate
-            atten_gate = self.attn_route(hidden_states)  # [B, T, 1]
-            # print("attn gate:", atten_gate.shape)
+        #     # Routing gate
+        #     atten_gate = self.attn_route(hidden_states)  # [B, T, 1]
+        #     # print("attn gate:", atten_gate.shape)
 
-            # Update via MOM
-            mem_out = self.context_mom(hidden_states)
-            mem_out = self.memory_norm(mem_out)
-            hidden_states = hidden_states + atten_gate * mem_out
-            # print("Memory Updated", M.shape)
-        else:
-            # Read-only
-            hidden_states = hidden_states
+        #     # Update via MOM
+        #     mem_out = self.context_mom(hidden_states)
+        #     mem_out = self.memory_norm(mem_out)
+        #     hidden_states = hidden_states + atten_gate * mem_out
+        #     # print("Memory Updated", M.shape)
+        # else:
+        #     # Read-only
+        #     hidden_states = hidden_states
 
         hidden_states = residual + hidden_states
 
@@ -135,8 +320,9 @@ class DecoderLayer(WhisperDecoderLayer):
         if encoder_hidden_states is not None:
             residual = hidden_states
             hidden_states = self.encoder_attn_layer_norm(hidden_states)
-            hidden_states, cross_attn_weights, _ = self.encoder_attn(
+            hidden_states, cross_attn_weights = self.encoder_attn(
                 hidden_states=hidden_states,
+                past_key_values = past_key_values,
                 key_value_states=encoder_hidden_states,
                 attention_mask=encoder_attention_mask,
                 output_attentions=output_attentions,
@@ -248,20 +434,23 @@ class Decoder(WhisperDecoder):
     main_input_name = "input_ids"
 
     def __init__(self, config: WhisperConfig, 
-        num_memories: int = 8,
-        bias_term_adjust=bias_term_adjust,
-        LinearAttentionMem=LinearAttentionMem,):
+        ):
+
         super().__init__(config)
+        # num_memories: int = 8,
+        # bias_term_adjust=bias_term_adjust,
+        # LinearAttentionMem=LinearAttentionMem,
        
         self.layers = nn.ModuleList(
             [DecoderLayer(config, 
-                          layer_idx, 
-                          num_memories=num_memories, 
-                          bias_term_adjust= bias_term_adjust, 
-                          LinearAttentionMem=LinearAttentionMem,
-                          is_memory_layer=(layer_idx == 2),) for layer_idx in range(config.decoder_layers)]
+                          layer_idx,) for layer_idx in range(config.decoder_layers)]
         )
 
+
+        #  num_memories=num_memories, 
+        #                   bias_term_adjust= bias_term_adjust, 
+        #                   LinearAttentionMem=LinearAttentionMem,
+        #                   is_memory_layer=(layer_idx == 2)
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -335,7 +524,7 @@ class Decoder(WhisperDecoder):
 
         hidden_states = inputs_embeds + positions.to(inputs_embeds.device)
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
-
+        
         causal_mask = create_causal_mask(
             config=self.config,
             input_embeds=inputs_embeds,
@@ -364,6 +553,7 @@ class Decoder(WhisperDecoder):
                 dropout_probability = torch.rand([])
                 if dropout_probability < self.layerdrop:
                     continue
+            
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -491,6 +681,8 @@ class Model(WhisperModel):
                 hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
                 attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
             )
+        
+        #print("enocder:", encoder_outputs)
 
         # decoder outputs consists of (dec_features, past_key_values, dec_hidden, dec_attn)
         decoder_outputs = self.decoder(
@@ -506,7 +698,6 @@ class Model(WhisperModel):
             return_dict=return_dict,
             cache_position=cache_position,
         )
-
         if not return_dict:
             return decoder_outputs + encoder_outputs
 
@@ -533,7 +724,7 @@ class ConditionalGeneration(WhisperForConditionalGeneration):
         # self.max_target_positions = config.max_target_positions
 
         # Initialize weights and apply final processing
-        self.post_init()
+        #self.post_init()
 
     def get_output_embeddings(self):
         return self.proj_out

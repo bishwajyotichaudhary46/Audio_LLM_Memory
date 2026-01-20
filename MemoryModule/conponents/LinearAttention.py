@@ -13,23 +13,23 @@ class LinearAttentionMem(nn.Module):
         self.n_text_state = n_text_state
 
         # Projections
-        self.keys_proj   = nn.Linear(n_text_state, self.n_text_state * n_heads, bias=bias)
-        self.values_proj = nn.Linear(n_text_state, self.n_text_state * n_heads, bias=bias)
+        self.keys_proj   = nn.Linear(n_text_state, self.n_text_state, bias=bias)
+        self.values_proj = nn.Linear(n_text_state, self.n_text_state, bias=bias)
         
 
         # Memory Initialization
-        self.register_buffer("M", torch.zeros(32, n_heads, n_text_state, n_text_state))
+        self.register_buffer("M", torch.zeros(32, n_heads, n_text_state//self.n_heads, n_text_state//self.n_heads))
 
         # foget Projections
-        self.forget = nn.Linear(n_text_state, self.n_heads )
+        self.forget = nn.Linear(n_text_state, self.n_heads)
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
         """ [B, S, n_text_state] → [B, S, H, D] """
         B, S, _ = x.shape
-        return x.view(B, S, self.n_heads, self.n_text_state)
+        return x.view(B, S, self.n_heads, self.n_text_state//self.n_heads)
 
 
-    def forward(self, x: torch.Tensor, router_weight: torch.Tensor, Mem_id):
+    def forward(self, x: torch.Tensor, router_weight: torch.Tensor = None, Mem_id=None):
         """
         Args:
             x     : [B, S, n_text_state]     current input chunk
@@ -53,16 +53,31 @@ class LinearAttentionMem(nn.Module):
 
         # Compute Forget
         forget = torch.sigmoid(self.forget(x))
+       
 
-        # Linear Attention Update
-        for t in range(S):
-            # Compute Memories Weight
-            memory_weight = router_weight[:,t,Mem_id, None, None,None]
+        with torch.no_grad():
+            forget = forget.float().mean(dim=1).to(forget.dtype)
+            #print(router_weight[:,:,Mem_id].shape)
+            # print(v.shape)
+            kv = torch.einsum('bshk,bshv->bshkv', k, v)
+            # print("kv",kv.shape)
+            # print("forget", forget.shape)
+            #contribute = router_weight[:,:,Mem_id, None, None, None]* kv
+            if router_weight is None:
+                self.M[:B] =  torch.einsum('bh,bhkv->bhkv', forget, self.M[:B]) +  kv.float().mean(dim=1)
+            else:
+                self.M[:B] =  torch.einsum('bh,bhkv->bhkv', forget, self.M[:B]) + torch.einsum('bs,bshkv->bshkv', router_weight[:,:,Mem_id], kv).float().mean(dim=1)
 
-            # Update memory M
-            with torch.no_grad():
-                self.M[:B] = forget[:,t,:, None, None]*self.M[:B] + memory_weight * torch.einsum('b h k, b h v -> b h k v', k[:, t], v[:, t])
-            # Compute output at time t
-            # o[:, t] = torch.einsum('b h k v, b h k -> b h v', M, q[:, t])
+            
+
+        # # Linear Attention Update
+        # for t in range(S):
+        #     # Compute Memories Weight
+        #     memory_weight = router_weight[:,t,Mem_id, None, None,None]
+
+        #     # Update memory M
+        #     with torch.no_grad():
+        #         self.M[:B] = forget[:,t,:, None, None]*self.M[:B] + memory_weight * torch.einsum('b h k, b h v -> b h k v', k[:, t], v[:, t])
+          
 
         return self.M[:B]
