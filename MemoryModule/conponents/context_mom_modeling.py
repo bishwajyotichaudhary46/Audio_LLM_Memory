@@ -47,11 +47,7 @@ from transformers.utils import (
 from transformers.models.whisper.configuration_whisper import WhisperConfig
 from transformers.models.whisper.generation_whisper import WhisperGenerationMixin
 
-# from MemoryModule.conponents.MomAttention import MomAttention
-
-from MemoryModule.conponents.context_memory import ContextMemory
-from MemoryModule.conponents.LMMBlock import LMMBlock
-from MemoryModule.conponents.config import TitansConfig
+from MemoryModule.conponents.MomAttention import MomAttention
 import torch.nn.functional as F
 
 
@@ -683,7 +679,6 @@ class WhisperEncoderLayer(nn.Module):
         self.fc2 = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -766,46 +761,21 @@ class WhisperDecoderLayer(nn.Module):
         self.fc1 = nn.Linear(self.embed_dim, config.decoder_ffn_dim)
         self.fc2 = nn.Linear(config.decoder_ffn_dim, self.embed_dim)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
-        # last layer use mom
-        # self.use_mom = (layer_idx % 2 == 0) and (layer_idx != 0)
-    
+         # last layer use mom
         self.use_mom = (layer_idx % 2 == 0)
-        # self.use_mom = (layer_idx % 4 == 0)
-        # self.use_mom = (layer_idx >= config.decoder_layers - 3)
 
-        if self.use_mom: 
-            # self.router_proj = nn.Linear(2*config.d_model, 1, bias=True)
-            self.mem_config = TitansConfig(
-                dim=config.d_model,
-                num_heads=8,
-                num_layers=4,
-                vocab_size=1000,
-                chunk_size=64,
-                window_size=64,
-                num_memory_layers=1,
+        if self.use_mom:
+            # self.router_proj = nn.Linear(config.d_model, 1, bias=True)
+
+            self.mom_attn = MomAttention(
+                hidden_size=config.d_model,
+                num_heads=config.decoder_attention_heads,
+                head_dim=config.d_model // config.decoder_attention_heads,
+                num_memories=8,        
+                topk=2,
+                shared_mem=True,
+                layer_idx=layer_idx,
             )
-
-            self.mem_block = LMMBlock(self.mem_config)
-            # self.mem_block_2 = LMMBlock(self.mem_config)
-            # self.mem_block_3 = LMMBlock(self.mem_config)
-
-
-        # if self.use_mom:
-        #     self.router_proj = nn.Linear(config.d_model, 1, bias=True)
-
-        #     self.alpha_proj = nn.Linear(config.d_model, 1, bias=True)
-
-        #     self.theta_proj = nn.Linear(config.d_model, 1, bias=True)
-
-        #     self.eta_proj = nn.Linear(config.d_model, 1, bias=True)
-
-        #     self.context_mem = ContextMemory(input_dim=config.d_model, 
-        #                                      hidden_dim=config.d_model, 
-        #                                      output_dim=config.d_model,
-        #                                      context_window=124, 
-        #                                      pm_len=128,
-        #                                      n_layers_nmm=4
-        #                                      )
 
             # self.fc11 = nn.Linear(self.embed_dim, config.decoder_ffn_dim)
             # self.fc22 = nn.Linear(config.decoder_ffn_dim, self.embed_dim)
@@ -836,7 +806,6 @@ class WhisperDecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = True,
         cache_position: Optional[torch.LongTensor] = None,
-        lang_embed: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Args:
@@ -887,38 +856,28 @@ class WhisperDecoderLayer(nn.Module):
             hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
             hidden_states = residual + hidden_states
 
-            if self.use_mom :
-                # print("hiddenstates", hidden_states.shape)
-                # print(lang_embed.shape)
-                lang_embed = lang_embed.unsqueeze(1).expand(hidden_states.size(0), hidden_states.size(1), self.embed_dim)
-                gate_states = torch.cat([lang_embed, hidden_states], dim=-1)
-                # print("gate states", gate_states.shape)
-                gate_logits = self.router_proj(gate_states)   # (bs, seq, 1)
-                gate = torch.sigmoid(gate_logits)
-             
-
             # mom
-            # router_logits = None
+            router_logits = None
             #print("Mom Used", self.use_mom)
-            # if self.use_mom:
+            if self.use_mom:
 
-            #     # Learnable gate
-            #     gate_logits = self.router_proj(hidden_states)   # (bs, seq, 1)
-            #     gate = torch.sigmoid(gate_logits)
-            #     # print("gate", gate)
-            #     alpha = torch.sigmoid(self.alpha_proj(hidden_states))   # (bs, seq, 1)
-            #     theta = torch.sigmoid(self.theta_proj(hidden_states))
-            #     eta = torch.sigmoid(self.eta_proj(hidden_states))
-            #     # MoM forward
-            #     mem_out = self.context_mem(
-            #         hidden_states,
-            #         alpha=alpha,
-            #         eta=eta,
-            #         theta = theta)
-            #     # print("mom out", mom_out)
-            #     mem_hidden_states =  F.dropout(
-            #         gate*mem_out, p=self.dropout, training=self.training
-            #     )
+                # Learnable gate
+                # gate_logits = self.router_proj(hidden_states)   # (bs, seq, 1)
+                # gate = torch.sigmoid(gate_logits)
+                #print("gate", gate)
+                # MoM forward
+                mom_out, _ , mom_present, router_logits = self.mom_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    past_key_values=None,
+                    use_cache=None,
+                    output_attentions=output_attentions     
+                )
+                # print("mom out", mom_out)
+
+                mom_hidden_states =  F.dropout(
+                    mom_out, p=self.dropout, training=self.training
+                )
                 # # print("mom hidden states:", mom_hidden_states)
                 # hidden_states = mom_hidden_states + hidden_states
 
@@ -933,21 +892,10 @@ class WhisperDecoderLayer(nn.Module):
         hidden_states = self.fc2(hidden_states)
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
-        
-        # print(hidden_states.shape)
 
-        if self.use_mom :
+        if self.use_mom:
+            hidden_states = hidden_states + mom_hidden_states
 
-            # mem_hidden_states, new_state = self.mem_block_1(hidden_states, encoder_hidden_states)
-           
-            # mem_hidden_states, new_state = self.mem_block_2(mem_hidden_states, encoder_hidden_states)
-            
-            mem_out, new_state = self.mem_block(hidden_states, encoder_hidden_states)
-            mem_hidden_states =  gate*mem_out
-            hidden_states = mem_hidden_states + hidden_states
-            
-        # if self.use_mom:
-        #     hidden_states = hidden_states + mem_hidden_states
 
             # hidden_states_1 = self.final_layer_norm_1(residual)
             # hidden_states_1 = self.activation_fn(self.fc11(hidden_states_1))
@@ -966,7 +914,10 @@ class WhisperDecoderLayer(nn.Module):
         if use_cache:
             outputs += (present_key_value,)
 
-        return outputs
+        if router_logits is not None:
+            return outputs, router_logits
+        else:
+            return outputs
 
 
 class WhisperPreTrainedModel(PreTrainedModel):
@@ -1326,9 +1277,6 @@ class WhisperDecoder(WhisperPreTrainedModel):
         self.layer_norm = nn.LayerNorm(config.d_model)
 
         self.gradient_checkpointing = False
-
-        self.lang_embed = None
-        
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1436,26 +1384,9 @@ class WhisperDecoder(WhisperPreTrainedModel):
             input_shape = inputs_embeds.size()[:-1]
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
-        
-        # if past_key_values is None:
-        #     # first decoding step
-        #     self.lang_id = input_ids[:, 1]
-        
 
-        # print(input_ids)
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-
-        if input_shape[1] >1 :
-            self.lang_embed = inputs_embeds[:,1,:]
-
-        
-        # print(self.lang_embed.shape)
-
-        # print(inputs_embeds.shape)
-        # print("1")
-        # lang = inputs_embeds[:,1, :]
-        # print(lang.shape)
 
         return_legacy_cache = False
         return_self_attention_cache = False
@@ -1537,7 +1468,8 @@ class WhisperDecoder(WhisperPreTrainedModel):
                     continue
 
             if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
+                if idx%2 == 0:
+                    layer_outputs, router_logits = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
                     causal_mask,
@@ -1549,23 +1481,51 @@ class WhisperDecoder(WhisperPreTrainedModel):
                     output_attentions,
                     use_cache,
                     cache_position,
-                    lang_embed = self.lang_embed
-                )
+                    )
+                else:
+
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        causal_mask,
+                        encoder_hidden_states,
+                        None,  # encoder attention mask
+                        head_mask[idx] if head_mask is not None else None,
+                        cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None,
+                        None,  # past_key_value
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                    )
             else:
-                layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=causal_mask,
-                encoder_hidden_states=encoder_hidden_states,
-                layer_head_mask=(head_mask[idx] if head_mask is not None else None),
-                cross_attn_layer_head_mask=(
-                    cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
-                ),
-                past_key_value=past_key_values if use_cache else None,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                lang_embed = self.lang_embed
-                )
+                if idx%2 == 0:
+                    layer_outputs, router_logits = decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        encoder_hidden_states=encoder_hidden_states,
+                        layer_head_mask=(head_mask[idx] if head_mask is not None else None),
+                        cross_attn_layer_head_mask=(
+                            cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
+                        ),
+                        past_key_value=past_key_values if use_cache else None,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    encoder_hidden_states=encoder_hidden_states,
+                    layer_head_mask=(head_mask[idx] if head_mask is not None else None),
+                    cross_attn_layer_head_mask=(
+                        cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
+                    ),
+                    past_key_value=past_key_values if use_cache else None,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    )
 
             #     layer_outputs = self._gradient_checkpointing_func(
             #         decoder_layer.__call__,
@@ -1621,12 +1581,13 @@ class WhisperDecoder(WhisperPreTrainedModel):
                 for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_cross_attentions]
                 if v is not None
             )
-        return BaseModelOutputWithPastAndCrossAttentions(
+        return MomOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
             cross_attentions=all_cross_attentions,
+            router_logits = all_router_logits
         )
 
 
@@ -1876,7 +1837,7 @@ class WhisperModel(WhisperPreTrainedModel):
         if not return_dict:
             return decoder_outputs + encoder_outputs
 
-        return Seq2SeqModelOutput(
+        return MomOutput(
             last_hidden_state=decoder_outputs.last_hidden_state,
             past_key_values=decoder_outputs.past_key_values,
             decoder_hidden_states=decoder_outputs.hidden_states,
@@ -1885,6 +1846,7 @@ class WhisperModel(WhisperPreTrainedModel):
             encoder_last_hidden_state=encoder_outputs.last_hidden_state,
             encoder_hidden_states=encoder_outputs.hidden_states,
             encoder_attentions=encoder_outputs.attentions,
+            router_logits = decoder_outputs.router_logits
         )
     
 
@@ -1901,6 +1863,7 @@ class WhisperForConditionalGeneration(WhisperGenerationMixin, WhisperPreTrainedM
         super().__init__(config)
         self.model = WhisperModel(config)
         self.proj_out = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        # self.proj_out_1 = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -2006,23 +1969,23 @@ class WhisperForConditionalGeneration(WhisperGenerationMixin, WhisperPreTrainedM
         )
         lm_logits = self.proj_out(outputs[0])
         # lm_logits_1 = self.proj_out_1(outputs[0])
-        # lm_logits = lm_logits + lm_logits_1
+        # lm_logits = (lm_logits + lm_logits_1)/2
         loss = None
-        # aux_loss = None
+        aux_loss = None
 
         if labels is not None:
             loss_fct = CrossEntropyLoss()
             # move labels to correct device to enable PP
             labels = labels.to(lm_logits.device)
             loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.reshape(-1))
-            # aux_loss = load_balancing_loss_func(
-            #     outputs.router_logits,
-            #     8,
-            #     2,
-            #     decoder_attention_mask,
-            # )
+            aux_loss = load_balancing_loss_func(
+                outputs.router_logits,
+                8,
+                2,
+                decoder_attention_mask,
+            )
 
-            # loss += aux_loss.to(loss.device) * 0.01
+            loss += aux_loss.to(loss.device) * 0.01
 
         if not return_dict:
             output = (lm_logits,) + outputs[1:]

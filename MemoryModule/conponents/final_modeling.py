@@ -49,8 +49,8 @@ from transformers.models.whisper.generation_whisper import WhisperGenerationMixi
 
 # from MemoryModule.conponents.MomAttention import MomAttention
 
-from MemoryModule.conponents.context_memory import ContextMemory
-from MemoryModule.conponents.LMMBlock import LMMBlock
+# from MemoryModule.conponents.context_memory import ContextMemory
+from MemoryModule.conponents.AssociativeMemory import TitansMemoryBlock
 from MemoryModule.conponents.config import TitansConfig
 import torch.nn.functional as F
 
@@ -768,24 +768,18 @@ class WhisperDecoderLayer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
         # last layer use mom
         # self.use_mom = (layer_idx % 2 == 0) and (layer_idx != 0)
-    
         self.use_mom = (layer_idx % 2 == 0)
         # self.use_mom = (layer_idx % 4 == 0)
         # self.use_mom = (layer_idx >= config.decoder_layers - 3)
 
         if self.use_mom: 
-            # self.router_proj = nn.Linear(2*config.d_model, 1, bias=True)
-            self.mem_config = TitansConfig(
-                dim=config.d_model,
-                num_heads=8,
-                num_layers=4,
-                vocab_size=1000,
-                chunk_size=64,
-                window_size=64,
-                num_memory_layers=1,
-            )
+            self.router_proj = nn.Linear(2 * config.d_model, 1, bias=True)
 
-            self.mem_block = LMMBlock(self.mem_config)
+            self.mem_block = TitansMemoryBlock(
+                dim=config.d_model,
+                mem_hidden_dim=config.d_model,
+                ffn_dim=config.d_model
+            )
             # self.mem_block_2 = LMMBlock(self.mem_config)
             # self.mem_block_3 = LMMBlock(self.mem_config)
 
@@ -888,12 +882,9 @@ class WhisperDecoderLayer(nn.Module):
             hidden_states = residual + hidden_states
 
             if self.use_mom :
-                # print("hiddenstates", hidden_states.shape)
-                # print(lang_embed.shape)
                 lang_embed = lang_embed.unsqueeze(1).expand(hidden_states.size(0), hidden_states.size(1), self.embed_dim)
                 gate_states = torch.cat([lang_embed, hidden_states], dim=-1)
-                # print("gate states", gate_states.shape)
-                gate_logits = self.router_proj(gate_states)   # (bs, seq, 1)
+                gate_logits = self.router_proj(gate_states)
                 gate = torch.sigmoid(gate_logits)
              
 
@@ -938,13 +929,15 @@ class WhisperDecoderLayer(nn.Module):
 
         if self.use_mom :
 
-            # mem_hidden_states, new_state = self.mem_block_1(hidden_states, encoder_hidden_states)
-           
-            # mem_hidden_states, new_state = self.mem_block_2(mem_hidden_states, encoder_hidden_states)
-            
-            mem_out, new_state = self.mem_block(hidden_states, encoder_hidden_states)
-            mem_hidden_states =  gate*mem_out
-            hidden_states = mem_hidden_states + hidden_states
+            mem_out = self.mem_block(
+                hidden_states,
+                encoder_hidden_states,
+            )
+
+            if gate is None:
+                hidden_states = hidden_states + mem_out
+            else:
+                hidden_states = hidden_states + gate * mem_out
             
         # if self.use_mom:
         #     hidden_states = hidden_states + mem_hidden_states

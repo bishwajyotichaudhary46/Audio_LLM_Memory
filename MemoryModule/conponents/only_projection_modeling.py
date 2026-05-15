@@ -20,7 +20,6 @@ from typing import Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.utils.checkpoint
-from dataclasses import dataclass
 from torch import nn
 from torch.nn import CrossEntropyLoss
 
@@ -47,13 +46,6 @@ from transformers.utils import (
 from transformers.models.whisper.configuration_whisper import WhisperConfig
 from transformers.models.whisper.generation_whisper import WhisperGenerationMixin
 
-# from MemoryModule.conponents.MomAttention import MomAttention
-
-from MemoryModule.conponents.context_memory import ContextMemory
-from MemoryModule.conponents.LMMBlock import LMMBlock
-from MemoryModule.conponents.config import TitansConfig
-import torch.nn.functional as F
-
 
 if is_flash_attn_2_available():
     from transformers.modeling_flash_attention_utils import _flash_attention_forward
@@ -66,87 +58,6 @@ _HIDDEN_STATES_START_POSITION = 1
 _CONFIG_FOR_DOC = "WhisperConfig"
 _CHECKPOINT_FOR_DOC = "openai/whisper-tiny"
 
-# Load Balancing Loss Function 
-def load_balancing_loss_func(
-    gate_logits: Union[torch.Tensor, tuple[torch.Tensor], None],
-    num_experts: Optional[int] = None,
-    top_k=2,
-    attention_mask: Optional[torch.Tensor] = None,
-) -> Union[torch.Tensor, int]:
-    r"""
-    Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
-
-    See Switch Transformer (https://huggingface.co/papers/2101.03961) for more details. This function implements the loss
-    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
-    experts is too unbalanced.
-
-    Args:
-        gate_logits:
-            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
-            shape [batch_size X sequence_length, num_experts].
-        num_experts:
-            Number of experts
-        top_k:
-            The number of experts to route per-token, can be also interpreted as the `top-k` routing
-            parameter.
-        attention_mask (`torch.Tensor`, *optional*):
-            The attention_mask used in forward function
-            shape [batch_size X sequence_length] if not None.
-
-    Returns:
-        The auxiliary loss.
-    """
-    if gate_logits is None or not isinstance(gate_logits, tuple):
-        return 0
-
-    if isinstance(gate_logits, tuple):
-        compute_device = gate_logits[0].device
-        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
-
-    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
-
-    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-
-    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
-
-    if attention_mask is None:
-        # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
-
-        # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.mean(routing_weights, dim=0)
-    else:
-        batch_size, sequence_length = attention_mask.shape
-        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
-
-        # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
-        expert_attention_mask = (
-            attention_mask[None, :, :, None, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
-            .reshape(-1, top_k, num_experts)
-            .to(compute_device)
-        )
-
-        # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
-            expert_attention_mask, dim=0
-        )
-
-        # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
-        router_per_expert_attention_mask = (
-            attention_mask[None, :, :, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
-            .reshape(-1, num_experts)
-            .to(compute_device)
-        )
-
-        # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
-            router_per_expert_attention_mask, dim=0
-        )
-
-    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
-    return overall_loss * num_experts
 
 def sinusoids(length: int, channels: int, max_timescale: float = 10000) -> torch.Tensor:
     """Returns sinusoids for positional embedding"""
@@ -683,7 +594,6 @@ class WhisperEncoderLayer(nn.Module):
         self.fc2 = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -766,63 +676,6 @@ class WhisperDecoderLayer(nn.Module):
         self.fc1 = nn.Linear(self.embed_dim, config.decoder_ffn_dim)
         self.fc2 = nn.Linear(config.decoder_ffn_dim, self.embed_dim)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
-        # last layer use mom
-        # self.use_mom = (layer_idx % 2 == 0) and (layer_idx != 0)
-    
-        self.use_mom = (layer_idx % 2 == 0)
-        # self.use_mom = (layer_idx % 4 == 0)
-        # self.use_mom = (layer_idx >= config.decoder_layers - 3)
-
-        if self.use_mom: 
-            # self.router_proj = nn.Linear(2*config.d_model, 1, bias=True)
-            self.mem_config = TitansConfig(
-                dim=config.d_model,
-                num_heads=8,
-                num_layers=4,
-                vocab_size=1000,
-                chunk_size=64,
-                window_size=64,
-                num_memory_layers=1,
-            )
-
-            self.mem_block = LMMBlock(self.mem_config)
-            # self.mem_block_2 = LMMBlock(self.mem_config)
-            # self.mem_block_3 = LMMBlock(self.mem_config)
-
-
-        # if self.use_mom:
-        #     self.router_proj = nn.Linear(config.d_model, 1, bias=True)
-
-        #     self.alpha_proj = nn.Linear(config.d_model, 1, bias=True)
-
-        #     self.theta_proj = nn.Linear(config.d_model, 1, bias=True)
-
-        #     self.eta_proj = nn.Linear(config.d_model, 1, bias=True)
-
-        #     self.context_mem = ContextMemory(input_dim=config.d_model, 
-        #                                      hidden_dim=config.d_model, 
-        #                                      output_dim=config.d_model,
-        #                                      context_window=124, 
-        #                                      pm_len=128,
-        #                                      n_layers_nmm=4
-        #                                      )
-
-            # self.fc11 = nn.Linear(self.embed_dim, config.decoder_ffn_dim)
-            # self.fc22 = nn.Linear(config.decoder_ffn_dim, self.embed_dim)
-            # self.final_layer_norm_1 = nn.LayerNorm(self.embed_dim)
-
-            # self.encoder_attn_1 = WHISPER_ATTENTION_CLASSES[config._attn_implementation](
-            # self.embed_dim,
-            # config.decoder_attention_heads,
-            # dropout=config.attention_dropout,
-            # is_decoder=True,
-            # layer_idx=layer_idx,
-            # config=config,
-            # )
-            # self.encoder_attn_layer_norm_1 = nn.LayerNorm(self.embed_dim)
-    
-            # self.memory_norm = nn.LayerNorm(config.d_model)
-
 
     def forward(
         self,
@@ -836,7 +689,6 @@ class WhisperDecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = True,
         cache_position: Optional[torch.LongTensor] = None,
-        lang_embed: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Args:
@@ -887,41 +739,6 @@ class WhisperDecoderLayer(nn.Module):
             hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
             hidden_states = residual + hidden_states
 
-            if self.use_mom :
-                # print("hiddenstates", hidden_states.shape)
-                # print(lang_embed.shape)
-                lang_embed = lang_embed.unsqueeze(1).expand(hidden_states.size(0), hidden_states.size(1), self.embed_dim)
-                gate_states = torch.cat([lang_embed, hidden_states], dim=-1)
-                # print("gate states", gate_states.shape)
-                gate_logits = self.router_proj(gate_states)   # (bs, seq, 1)
-                gate = torch.sigmoid(gate_logits)
-             
-
-            # mom
-            # router_logits = None
-            #print("Mom Used", self.use_mom)
-            # if self.use_mom:
-
-            #     # Learnable gate
-            #     gate_logits = self.router_proj(hidden_states)   # (bs, seq, 1)
-            #     gate = torch.sigmoid(gate_logits)
-            #     # print("gate", gate)
-            #     alpha = torch.sigmoid(self.alpha_proj(hidden_states))   # (bs, seq, 1)
-            #     theta = torch.sigmoid(self.theta_proj(hidden_states))
-            #     eta = torch.sigmoid(self.eta_proj(hidden_states))
-            #     # MoM forward
-            #     mem_out = self.context_mem(
-            #         hidden_states,
-            #         alpha=alpha,
-            #         eta=eta,
-            #         theta = theta)
-            #     # print("mom out", mom_out)
-            #     mem_hidden_states =  F.dropout(
-            #         gate*mem_out, p=self.dropout, training=self.training
-            #     )
-                # # print("mom hidden states:", mom_hidden_states)
-                # hidden_states = mom_hidden_states + hidden_states
-
             # add cross-attn to positions 1 of present_key_value tuple
             present_key_value = (present_key_value, cross_attn_present_key_value)
 
@@ -933,30 +750,6 @@ class WhisperDecoderLayer(nn.Module):
         hidden_states = self.fc2(hidden_states)
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
-        
-        # print(hidden_states.shape)
-
-        if self.use_mom :
-
-            # mem_hidden_states, new_state = self.mem_block_1(hidden_states, encoder_hidden_states)
-           
-            # mem_hidden_states, new_state = self.mem_block_2(mem_hidden_states, encoder_hidden_states)
-            
-            mem_out, new_state = self.mem_block(hidden_states, encoder_hidden_states)
-            mem_hidden_states =  gate*mem_out
-            hidden_states = mem_hidden_states + hidden_states
-            
-        # if self.use_mom:
-        #     hidden_states = hidden_states + mem_hidden_states
-
-            # hidden_states_1 = self.final_layer_norm_1(residual)
-            # hidden_states_1 = self.activation_fn(self.fc11(hidden_states_1))
-            # hidden_states_1 = nn.functional.dropout(hidden_states_1, p=self.activation_dropout, training=self.training)
-            # hidden_states_1 = self.fc22(hidden_states_1)
-            # hidden_states_1 = nn.functional.dropout(hidden_states_1, p=self.dropout, training=self.training)
-            # hidden_states_1 = residual + hidden_states_1
-            # if gate is not None:
-            #     hidden_states = hidden_states + gate * hidden_states_1
 
         outputs = (hidden_states,)
 
@@ -1292,9 +1085,7 @@ class WhisperEncoder(WhisperPreTrainedModel):
             last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions
         )
 
-@dataclass
-class MomOutputWithPastAndCrossAttentions(BaseModelOutputWithPastAndCrossAttentions):
-    router_logits: Optional[Tuple[torch.FloatTensor, ...]] = None
+
 class WhisperDecoder(WhisperPreTrainedModel):
     """
     Transformer decoder consisting of *config.decoder_layers* layers. Each layer is a [`WhisperDecoderLayer`]
@@ -1326,9 +1117,6 @@ class WhisperDecoder(WhisperPreTrainedModel):
         self.layer_norm = nn.LayerNorm(config.d_model)
 
         self.gradient_checkpointing = False
-
-        self.lang_embed = None
-        
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1436,26 +1224,9 @@ class WhisperDecoder(WhisperPreTrainedModel):
             input_shape = inputs_embeds.size()[:-1]
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
-        
-        # if past_key_values is None:
-        #     # first decoding step
-        #     self.lang_id = input_ids[:, 1]
-        
 
-        # print(input_ids)
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-
-        if input_shape[1] >1 :
-            self.lang_embed = inputs_embeds[:,1,:]
-
-        
-        # print(self.lang_embed.shape)
-
-        # print(inputs_embeds.shape)
-        # print("1")
-        # lang = inputs_embeds[:,1, :]
-        # print(lang.shape)
 
         return_legacy_cache = False
         return_self_attention_cache = False
@@ -1517,7 +1288,7 @@ class WhisperDecoder(WhisperPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         all_cross_attentions = () if (output_attentions and encoder_hidden_states is not None) else None
-        all_router_logits = ()
+
         # check if head_mask/cross_attn_head_mask has a correct number of layers specified if desired
         for attn_mask, mask_name in zip([head_mask, cross_attn_head_mask], ["head_mask", "cross_attn_head_mask"]):
             if attn_mask is not None:
@@ -1525,8 +1296,6 @@ class WhisperDecoder(WhisperPreTrainedModel):
                     f"The `{mask_name}` should be specified for {len(self.layers)} layers, but it is for"
                     f" {head_mask.size()[0]}."
                 )
-
-        router_logits = None
         for idx, decoder_layer in enumerate(self.layers):
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             if output_hidden_states:
@@ -1549,51 +1318,21 @@ class WhisperDecoder(WhisperPreTrainedModel):
                     output_attentions,
                     use_cache,
                     cache_position,
-                    lang_embed = self.lang_embed
                 )
             else:
                 layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=causal_mask,
-                encoder_hidden_states=encoder_hidden_states,
-                layer_head_mask=(head_mask[idx] if head_mask is not None else None),
-                cross_attn_layer_head_mask=(
-                    cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
-                ),
-                past_key_value=past_key_values if use_cache else None,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                lang_embed = self.lang_embed
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    encoder_hidden_states=encoder_hidden_states,
+                    layer_head_mask=(head_mask[idx] if head_mask is not None else None),
+                    cross_attn_layer_head_mask=(
+                        cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
+                    ),
+                    past_key_value=past_key_values if use_cache else None,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
                 )
-
-            #     layer_outputs = self._gradient_checkpointing_func(
-            #         decoder_layer.__call__,
-            #         hidden_states,
-            #         causal_mask,
-            #         encoder_hidden_states,
-            #         None,  # encoder attention mask
-            #         head_mask[idx] if head_mask is not None else None,
-            #         cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None,
-            #         None,  # past_key_value
-            #         output_attentions,
-            #         use_cache,
-            #         cache_position,
-            #     )
-            # else:
-            #     layer_outputs = decoder_layer(
-            #         hidden_states,
-            #         attention_mask=causal_mask,
-            #         encoder_hidden_states=encoder_hidden_states,
-            #         layer_head_mask=(head_mask[idx] if head_mask is not None else None),
-            #         cross_attn_layer_head_mask=(
-            #             cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
-            #         ),
-            #         past_key_value=past_key_values if use_cache else None,
-            #         output_attentions=output_attentions,
-            #         use_cache=use_cache,
-            #         cache_position=cache_position,
-            #     )
             hidden_states = layer_outputs[0]
 
             if output_attentions:
@@ -1601,9 +1340,6 @@ class WhisperDecoder(WhisperPreTrainedModel):
 
                 if encoder_hidden_states is not None:
                     all_cross_attentions += (layer_outputs[2],)
-
-            if router_logits is not None:
-                all_router_logits += (router_logits,)
 
         hidden_states = self.layer_norm(hidden_states)
         # add hidden states from the last decoder layer
@@ -1628,7 +1364,6 @@ class WhisperDecoder(WhisperPreTrainedModel):
             attentions=all_self_attns,
             cross_attentions=all_cross_attentions,
         )
-
 
     # Copied from transformers.models.llama.modeling_llama.LlamaModel._update_causal_mask
     def _update_causal_mask(
@@ -1716,10 +1451,6 @@ class WhisperDecoder(WhisperPreTrainedModel):
     "The bare Whisper Model outputting raw hidden-states without any specific head on top.",
     WHISPER_START_DOCSTRING,
 )
-@dataclass
-class MomOutput(Seq2SeqModelOutput):
-    router_logits: Optional[Tuple[torch.FloatTensor, ...]] = None
-
 class WhisperModel(WhisperPreTrainedModel):
     def __init__(self, config: WhisperConfig):
         super().__init__(config)
@@ -1886,7 +1617,6 @@ class WhisperModel(WhisperPreTrainedModel):
             encoder_hidden_states=encoder_outputs.hidden_states,
             encoder_attentions=encoder_outputs.attentions,
         )
-    
 
 
 @add_start_docstrings(
@@ -1901,6 +1631,7 @@ class WhisperForConditionalGeneration(WhisperGenerationMixin, WhisperPreTrainedM
         super().__init__(config)
         self.model = WhisperModel(config)
         self.proj_out = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.proj_out_1 = nn.Linear(config.d_model, config.vocab_size, bias=True)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -2005,24 +1736,15 @@ class WhisperForConditionalGeneration(WhisperGenerationMixin, WhisperPreTrainedM
             cache_position=cache_position,
         )
         lm_logits = self.proj_out(outputs[0])
-        # lm_logits_1 = self.proj_out_1(outputs[0])
-        # lm_logits = lm_logits + lm_logits_1
-        loss = None
-        # aux_loss = None
+        lm_logits_1 = self.proj_out_1(outputs[0])
+        lm_logits = (lm_logits + lm_logits_1)/2
 
+        loss = None
         if labels is not None:
             loss_fct = CrossEntropyLoss()
             # move labels to correct device to enable PP
             labels = labels.to(lm_logits.device)
             loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.reshape(-1))
-            # aux_loss = load_balancing_loss_func(
-            #     outputs.router_logits,
-            #     8,
-            #     2,
-            #     decoder_attention_mask,
-            # )
-
-            # loss += aux_loss.to(loss.device) * 0.01
 
         if not return_dict:
             output = (lm_logits,) + outputs[1:]

@@ -70,9 +70,16 @@ class MOM(nn.Module):
 
         # Router
         router_weight = self.router(x)                          # [B, S, num_memories]
+
+        # if training:
         routing_weight, self.bias[:B] = self.bias_term_adjust(router_weight,
-                                                     self.softmax,
-                                                     avg_load_per_expert, self.num_memories, self.bias[:B])
+                                                        self.softmax,
+                                                        avg_load_per_expert, self.num_memories, self.bias[:B])
+        # else:
+        #     routing_weight, _ = self.bias_term_adjust(router_weight,
+        #                                                 self.softmax,
+        #                                                 avg_load_per_expert, self.num_memories, self.bias[:B])
+
 
         # M emory Temp
         memory_outputs = []
