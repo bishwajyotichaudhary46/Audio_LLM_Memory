@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from .config import TitansConfig
 from .memory import NeuralLongTermMemory, MemoryState, RMSNorm
 
-from .TAS_NN import TASNeuralLongTermMemory
+# from .TAS_NN import TASNeuralLongTermMemory
 
 # FeedForward — SwiGLU, identical logic to original
 class FeedForward(nn.Module):
@@ -97,7 +97,7 @@ class LMMBlock(nn.Module):
         state:                 MemoryState | None  = None,
     ) -> tuple[torch.Tensor, MemoryState]:
 
-        # Sub-layer 1: long-term memory 
+        #  long-term memory 
         residual = x
         normed   = self.norm1(x)
 
@@ -109,9 +109,9 @@ class LMMBlock(nn.Module):
 
         # sigmoid inline — one fewer Python call than nn.Sequential
         gate = torch.sigmoid(self.gate_proj(normed))    # (B, S, D)
-        x    = residual + self.drop(gate * mem_out)
+        x    =  residual + self.drop(gate*mem_out)
 
-        # Sub-layer 2: feed-forward
+        # feed-forward
         residual = mem_out
         x        = residual + self.drop(self.ffn(self.norm2(x)))
 

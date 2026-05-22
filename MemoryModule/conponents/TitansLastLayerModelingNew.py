@@ -532,7 +532,7 @@ class WhisperDecoderLayer(nn.Module):
 
         if self.use_mem:
             # self.alpha = nn.Parameter(torch.tensor(1e-3))
-            self.router_proj = nn.Linear(config.d_model, 1, bias=True)
+            self.router_proj = nn.Linear(2*config.d_model, 1, bias=True)
             titans_cfg = TitansConfig(
                 dim=config.d_model,
                 num_heads=config.decoder_attention_heads,
@@ -540,7 +540,7 @@ class WhisperDecoderLayer(nn.Module):
                 vocab_size=config.vocab_size,
                 chunk_size=64,
                 window_size=64,
-                num_memory_layers=2,
+                num_memory_layers=3,
             )
             # LMMBlock owns the FFN for this layer.
             # It also exposes persistent_tokens used below in forward().
@@ -609,14 +609,14 @@ class WhisperDecoderLayer(nn.Module):
             present_key_value = (present_key_value, cross_attn_pkv)
 
 
-        if self.use_mem :
-                # print("hiddenstates", hidden_states.shape)
-                # print(lang_embed.shape)
-                # lang_embed = lang_embed.unsqueeze(1).expand(hidden_states.size(0), hidden_states.size(1), self.embed_dim)
-                # gate_states = torch.cat([lang_embed, hidden_states], dim=-1)
-                # print("gate states", gate_states.shape)
-                gate_logits = self.router_proj(hidden_states)   # (bs, seq, 1)
-                gate = torch.sigmoid(gate_logits)
+        # if self.use_mem :
+        #         # print("hiddenstates", hidden_states.shape)
+        #         # print(lang_embed.shape)
+        #         # lang_embed = lang_embed.unsqueeze(1).expand(hidden_states.size(0), hidden_states.size(1), self.embed_dim)
+        #         # gate_states = torch.cat([lang_embed, hidden_states], dim=-1)
+        #         # print("gate states", gate_states.shape)
+        #         gate_logits = self.router_proj(hidden_states)   # (bs, seq, 1)
+        #         gate = torch.sigmoid(gate_logits)
    
         
    
@@ -646,6 +646,9 @@ class WhisperDecoderLayer(nn.Module):
             )
             mem_out = F.dropout(mem_out, p=self.dropout, training=self.training)
             # hidden_states = hidden_states + mem_out
+            gate_states = torch.cat([mem_out, hidden_states], dim=-1)
+            gate_logits = self.router_proj(gate_states)   # (bs, seq, 1)
+            gate = torch.sigmoid(gate_logits)
     
             hidden_states = hidden_states + gate * mem_out
 
