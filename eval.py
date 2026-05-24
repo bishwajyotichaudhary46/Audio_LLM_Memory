@@ -4,7 +4,7 @@ import evaluate
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
 
-from datasets import load_dataset, Audio
+from datasets import load_dataset, load_from_disk, Audio
 from transformers import (
     WhisperFeatureExtractor,
     WhisperTokenizer,
@@ -23,8 +23,9 @@ from transformers import (
 # from MemoryModule.conponents.only_projection_modeling import (
 #     WhisperForConditionalGeneration as WhisperCustom
 # )
-from MemoryModule.conponents.TitansLastLayerModelingNew import WhisperForConditionalGeneration as WhisperCustom
-
+from MemoryModule.conponents.TitansLastLayerModelingNew import (
+    WhisperForConditionalGeneration as WhisperCustom,
+)
 
 # Device (CPU)
 device = torch.device("cuda")
@@ -35,7 +36,7 @@ feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-medi
 tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-medium")
 processor = WhisperProcessor.from_pretrained("openai/whisper-medium")
 # model_mem = WhisperForConditionalGeneration.from_pretrained("whisper_translation_full_tunning/checkpoint-36315").to(device)
-model_mem = WhisperCustom.from_pretrained("artifacts/transcribe/memory/last_layer/sft/memory_router_alpha_only/best_model", local_files_only=True).to(device)
+model_mem = WhisperCustom.from_pretrained("artifacts/transcribe/memory/memory_3_last_layer/dpo/best_model", local_files_only=True).to(device)
 # Disable weight tying so proj_out is saved as an independent param
 model_mem.config.tie_word_embeddings = False
 model_mem.proj_out.weight = torch.nn.Parameter(
@@ -46,15 +47,9 @@ model_mem.proj_out.weight = torch.nn.Parameter(
 #     model_mem.load_state_dict(state_dict, strict=False)
 
 # Load CSV dataset
-dataset = load_dataset(
-    "csv",
-    data_files="Data/eval.csv"
-)
+dataset = load_from_disk("artifacts/Data/eval_en")
 
-# Add audio file paths
-dataset = dataset.map(
-    lambda x: {"audio_path": f"Data/eval/{x['utt_id']}.flac"}
-)
+
 
 # Cast audio column
 dataset = dataset.cast_column(
