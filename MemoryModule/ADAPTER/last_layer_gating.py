@@ -678,7 +678,7 @@ class WhisperDecoderLayer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
         self.use_adapter = (layer_idx >= config.decoder_layers - 1) 
         if self.use_adapter:
-            self.router_proj = nn.Linear(2*config.d_model, 1, bias=True)
+            self.router_proj = nn.Linear(config.d_model, 1, bias=True)
             self.fc11 = nn.Linear(self.embed_dim, config.decoder_ffn_dim)
             self.fc22 = nn.Linear(config.decoder_ffn_dim, self.embed_dim)
             self.final_layer_norm_0 = nn.LayerNorm(self.embed_dim)
@@ -766,8 +766,8 @@ class WhisperDecoderLayer(nn.Module):
             hidden_states = self.fc22(hidden_states)
             hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
             # router 
-            gate_states = torch.cat([hidden_states, residual], dim=-1)
-            gate_logits = self.router_proj(gate_states)   # (bs, seq, 1)
+            # gate_states = torch.cat([hidden_states, residual], dim=-1)
+            gate_logits = self.router_proj(residual)   # (bs, seq, 1)
             gate = torch.sigmoid(gate_logits)
             hidden_states = gate * hidden_states
             hidden_states = residual + hidden_states
