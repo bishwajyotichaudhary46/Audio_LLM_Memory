@@ -625,6 +625,8 @@ class WhisperDecoderLayer(nn.Module):
 
         new_mem_state: Optional[MemoryState] = None
 
+        gate = None
+
         if self.use_mem:
             # Correct call: keyword argument for encoder_hidden_states
             mem_out, new_mem_state = self.mem_block(
@@ -655,7 +657,12 @@ class WhisperDecoderLayer(nn.Module):
         if use_cache:
             outputs += (present_key_value,)
 
-        outputs += (hidden_states_0,new_mem_state,)    # always last; None for non-MAL layers
+        
+        
+        if gate is not None:
+            outputs += (gate,hidden_states_0,)
+        
+        outputs += (new_mem_state,)    # always last; None for non-MAL layers
 
         return outputs
 
