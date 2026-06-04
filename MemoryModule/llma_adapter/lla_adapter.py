@@ -1,0 +1,1533 @@
+# coding=utf-8
+"""
+Whisper + Titans Integration — MAL (Memory as Layer) variant.
+LlamaDecoderLayer edition.
+
+Architecture
+============
+Every decoder layer:
+    self-attn → cross-attn → FFN
+
+MAL decoder layers (layer_idx >= config.decoder_layers - 1), additionally ON TOP:
+    → LlamaDecoderLayer   (replaces self_attn_mem + fc11/fc22/final_layer_norm_mem)
+
+Key design points
+=================
+1. FFN is never removed or replaced — LlamaDecoderLayer is purely additive.
+2. LlamaDecoderLayer uses layer_idx=0 inside its own private DynamicCache
+   (_mem_attn_cache) so it never collides with the shared EncoderDecoderCache.
+3. new_mem_state is always the LAST element of the output tuple.
+4. reset_mem_states() clears both MemoryState dict and all _mem_attn_cache objects.
+5. _mem_attn_cache grows unboundedly by default; set MAX_MEM_TOKENS to cap it.
+
+Fixes applied
+=============
+FIX 1 — AttributeError: 'DynamicCache' object has no attribute 'is_updated'
+    All three attention classes check isinstance(past_key_value, EncoderDecoderCache)
+    before accessing .is_updated. Plain DynamicCache (used by _mem_attn_cache)
+    takes a direct path with is_updated=False.
+
+FIX 2 — torch.utils.checkpoint.CheckpointError (shape doubled on recompute)
+    a) Updated cache is assigned to self._mem_attn_cache AFTER the attention
+       call returns, keeping the call side-effect-free w.r.t. cache growth.
+    b) make_ckpt_call() snapshots _mem_attn_cache BEFORE the checkpointed call
+       and restores it at the top of ckpt_call() so recompute == original forward.
+"""
+
+import math
+from typing import Optional, Tuple
+
+import numpy as np
+import torch
+import torch.utils.checkpoint
+from dataclasses import dataclass
+from torch import nn
+from torch.nn import CrossEntropyLoss
+import torch.nn.functional as F
+
+from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, DynamicCache, EncoderDecoderCache, StaticCache
+from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+from transformers.modeling_outputs import (
+    BaseModelOutput,
+    BaseModelOutputWithPastAndCrossAttentions,
+    CausalLMOutputWithCrossAttentions,
+    Seq2SeqLMOutput,
+    Seq2SeqModelOutput,
+    SequenceClassifierOutput,
+)
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import (
+    add_start_docstrings,
+    add_start_docstrings_to_model_forward,
+    is_flash_attn_2_available,
+    is_flash_attn_greater_or_equal_2_10,
+    logging,
+    replace_return_docstrings,
+)
+from transformers.models.whisper.configuration_whisper import WhisperConfig
+from transformers.models.whisper.generation_whisper import WhisperGenerationMixin
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from transformers.models.llama.configuration_llama import LlamaConfig
+
+from MemoryModule.conponents.tranformer_block import FeedForwardBlock
+from MemoryModule.conponents.memory import MemoryState
+from MemoryModule.conponents.config import TitansConfig
+
+if is_flash_attn_2_available():
+    from transformers.modeling_flash_attention_utils import _flash_attention_forward
+
+logger = logging.get_logger(__name__)
+
+_HIDDEN_STATES_START_POSITION = 1
+_CONFIG_FOR_DOC               = "WhisperConfig"
+_CHECKPOINT_FOR_DOC           = "openai/whisper-tiny"
+
+# Maximum number of tokens to keep in _mem_attn_cache.
+# Set to None to disable trimming (unbounded growth).
+MAX_MEM_TOKENS: Optional[int] = 64
+
+
+
+# Utility helpers
+
+
+def sinusoids(length: int, channels: int, max_timescale: float = 10000) -> torch.Tensor:
+    if channels % 2 != 0:
+        raise ValueError(
+            f"Number of channels has to be divisible by 2 for sinusoidal positional embeddings, "
+            f"got {channels} channels."
+        )
+    log_timescale_increment = math.log(max_timescale) / (channels // 2 - 1)
+    inv_timescales          = torch.exp(-log_timescale_increment * torch.arange(channels // 2))
+    scaled_time             = torch.arange(length).view(-1, 1) * inv_timescales.view(1, -1)
+    return torch.cat([scaled_time.sin(), scaled_time.cos()], dim=1)
+
+
+def shift_tokens_right(
+    input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int
+):
+    shifted_input_ids        = input_ids.new_zeros(input_ids.shape)
+    shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()
+    shifted_input_ids[:, 0]  = decoder_start_token_id
+    if pad_token_id is None:
+        raise ValueError("self.model.config.pad_token_id has to be defined.")
+    shifted_input_ids.masked_fill_(shifted_input_ids == -100, pad_token_id)
+    return shifted_input_ids
+
+
+def _compute_mask_indices(
+    shape: Tuple[int, int],
+    mask_prob: float,
+    mask_length: int,
+    attention_mask: Optional[torch.LongTensor] = None,
+    min_masks: int = 0,
+) -> np.ndarray:
+    batch_size, sequence_length = shape
+    if mask_length < 1:
+        raise ValueError("`mask_length` has to be bigger than 0.")
+    if mask_length > sequence_length:
+        raise ValueError(
+            f"`mask_length` has to be smaller than `sequence_length`, but got "
+            f"`mask_length`: {mask_length} and `sequence_length`: {sequence_length}`"
+        )
+    epsilon = np.random.rand(1).item()
+
+    def compute_num_masked_span(input_length):
+        num_masked_span = int(mask_prob * input_length / mask_length + epsilon)
+        num_masked_span = max(num_masked_span, min_masks)
+        if num_masked_span * mask_length > sequence_length:
+            num_masked_span = sequence_length // mask_length
+        if input_length - (mask_length - 1) < num_masked_span:
+            num_masked_span = max(input_length - (mask_length - 1), 0)
+        return num_masked_span
+
+    input_lengths = (
+        attention_mask.sum(-1).detach().tolist()
+        if attention_mask is not None
+        else [sequence_length for _ in range(batch_size)]
+    )
+    spec_aug_mask       = np.zeros((batch_size, sequence_length), dtype=bool)
+    spec_aug_mask_idxs  = []
+    max_num_masked_span = compute_num_masked_span(sequence_length)
+    if max_num_masked_span == 0:
+        return spec_aug_mask
+
+    for input_length in input_lengths:
+        num_masked_span   = compute_num_masked_span(input_length)
+        spec_aug_mask_idx = np.random.choice(
+            np.arange(input_length - (mask_length - 1)), num_masked_span, replace=False
+        )
+        if len(spec_aug_mask_idx) == 0:
+            dummy_mask_idx = sequence_length - 1
+        else:
+            dummy_mask_idx = spec_aug_mask_idx[0]
+        spec_aug_mask_idx = np.concatenate(
+            [spec_aug_mask_idx,
+             np.ones(max_num_masked_span - num_masked_span, dtype=np.int32) * dummy_mask_idx]
+        )
+        spec_aug_mask_idxs.append(spec_aug_mask_idx)
+
+    spec_aug_mask_idxs = np.array(spec_aug_mask_idxs)
+    spec_aug_mask_idxs = np.broadcast_to(
+        spec_aug_mask_idxs[:, :, None], (batch_size, max_num_masked_span, mask_length)
+    )
+    spec_aug_mask_idxs = spec_aug_mask_idxs.reshape(batch_size, max_num_masked_span * mask_length)
+    offsets = np.arange(mask_length)[None, None, :]
+    offsets = np.broadcast_to(
+        offsets, (batch_size, max_num_masked_span, mask_length)
+    ).reshape(batch_size, max_num_masked_span * mask_length)
+    spec_aug_mask_idxs = spec_aug_mask_idxs + offsets
+    if spec_aug_mask_idxs.max() > sequence_length - 1:
+        spec_aug_mask_idxs[spec_aug_mask_idxs > sequence_length - 1] = sequence_length - 1
+    np.put_along_axis(spec_aug_mask, spec_aug_mask_idxs, 1, -1)
+    return spec_aug_mask
+
+
+
+# Positional embedding
+
+
+class WhisperPositionalEmbedding(nn.Embedding):
+    def __init__(self, num_positions: int, embedding_dim: int,
+                 padding_idx: Optional[int] = None):
+        super().__init__(num_positions, embedding_dim)
+
+    def forward(self, input_ids, past_key_values_length=0, position_ids=None):
+        if position_ids is None:
+            return self.weight[past_key_values_length:past_key_values_length + input_ids.shape[1]]
+        else:
+            return self.weight[position_ids]
+
+
+
+# Attention implementations (FIX 1 applied to all three)
+
+
+class WhisperAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need'."""
+
+    def __init__(self, embed_dim, num_heads, dropout=0.0, is_decoder=False,
+                 bias=True, is_causal=False, layer_idx=None, config=None):
+        super().__init__()
+        self.embed_dim  = embed_dim
+        self.num_heads  = num_heads
+        self.dropout    = dropout
+        self.head_dim   = embed_dim // num_heads
+        self.config     = config
+        if (self.head_dim * num_heads) != self.embed_dim:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads "
+                f"(got embed_dim={self.embed_dim} and num_heads={num_heads})."
+            )
+        self.scaling    = self.head_dim ** -0.5
+        self.is_decoder = is_decoder
+        self.is_causal  = is_causal
+        if layer_idx is None and is_decoder:
+            logger.warning_once(
+                f"Instantiating a decoder {self.__class__.__name__} without `layer_idx` "
+                "is not recommended and will cause errors if caching is used."
+            )
+        self.layer_idx = layer_idx
+        self.k_proj    = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.v_proj    = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.q_proj    = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj  = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+    def forward(self, hidden_states, key_value_states=None, past_key_value=None,
+                attention_mask=None, layer_head_mask=None, output_attentions=False,
+                cache_position=None):
+        is_cross_attention = key_value_states is not None
+        bsz, tgt_len, _    = hidden_states.size()
+        query_states       = self._shape(self.q_proj(hidden_states) * self.scaling, tgt_len, bsz)
+
+        if past_key_value is not None:
+            if isinstance(past_key_value, EncoderDecoderCache):
+                is_updated = past_key_value.is_updated.get(self.layer_idx)
+                if is_cross_attention:
+                    past_key_value.is_updated[self.layer_idx] = True
+                    past_key_value = past_key_value.cross_attention_cache
+                else:
+                    past_key_value = past_key_value.self_attention_cache
+            else:
+                # Plain DynamicCache (e.g. _mem_attn_cache) — use directly.
+                is_updated = False
+
+        current_states = key_value_states if key_value_states is not None else hidden_states
+        if is_cross_attention and past_key_value is not None and is_updated:
+            key_states   = past_key_value.key_cache[self.layer_idx]
+            value_states = past_key_value.value_cache[self.layer_idx]
+        else:
+            key_states   = self._shape(self.k_proj(current_states), -1, bsz)
+            value_states = self._shape(self.v_proj(current_states), -1, bsz)
+            if past_key_value is not None:
+                cache_position = cache_position if not is_cross_attention else None
+                key_states, value_states = past_key_value.update(
+                    key_states, value_states, self.layer_idx, {"cache_position": cache_position}
+                )
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
+        if attention_mask is not None:
+            causal_mask  = attention_mask[:, :, :, :key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        if layer_head_mask is not None:
+            if layer_head_mask.size() != (self.num_heads,):
+                raise ValueError(
+                    f"Head mask for a single layer should be of size {(self.num_heads,)}, "
+                    f"but is {layer_head_mask.size()}"
+                )
+            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights
+
+        attn_probs  = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+        attn_output = torch.matmul(attn_probs, value_states)
+
+        if attn_output.size() != (bsz, self.num_heads, tgt_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, tgt_len, self.head_dim)}, "
+                f"but is {attn_output.size()}"
+            )
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, tgt_len, self.embed_dim)
+        attn_output = self.out_proj(attn_output)
+        return attn_output, attn_weights, past_key_value
+
+
+class WhisperFlashAttention2(WhisperAttention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+
+    def forward(self, hidden_states, key_value_states=None, past_key_value=None,
+                attention_mask=None, layer_head_mask=None, output_attentions=False,
+                cache_position=None):
+        if isinstance(past_key_value, StaticCache):
+            raise ValueError("StaticCache is not compatible with flash_attention_2.")
+        if output_attentions:
+            raise ValueError("WhisperFlashAttention2 does not support output_attentions.")
+
+        is_cross_attention = key_value_states is not None
+        bsz, tgt_len, _    = hidden_states.size()
+        query_states       = torch.reshape(
+            self.q_proj(hidden_states), (bsz, tgt_len, self.num_heads, self.head_dim)
+        )
+
+        if past_key_value is not None:
+            if isinstance(past_key_value, EncoderDecoderCache):
+                is_updated = past_key_value.is_updated.get(self.layer_idx)
+                if is_cross_attention:
+                    past_key_value.is_updated[self.layer_idx] = True
+                    past_key_value = past_key_value.cross_attention_cache
+                else:
+                    past_key_value = past_key_value.self_attention_cache
+            else:
+                is_updated = False
+
+        current_states = key_value_states if key_value_states is not None else hidden_states
+        if is_cross_attention and past_key_value is not None and is_updated:
+            key_states   = past_key_value.key_cache[self.layer_idx]
+            value_states = past_key_value.value_cache[self.layer_idx]
+        else:
+            key_states   = self._shape(self.k_proj(current_states), -1, bsz)
+            value_states = self._shape(self.v_proj(current_states), -1, bsz)
+            if past_key_value is not None:
+                cache_position = cache_position if not is_cross_attention else None
+                key_states, value_states = past_key_value.update(
+                    key_states, value_states, self.layer_idx, {"cache_position": cache_position}
+                )
+
+        key_states   = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+        causal_mask  = attention_mask
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, :key_states.shape[-2]]
+
+        input_dtype = query_states.dtype
+        if input_dtype == torch.float32:
+            if torch.is_autocast_enabled():
+                target_dtype = torch.get_autocast_gpu_dtype()
+            elif hasattr(self.config, "_pre_quantization_dtype"):
+                target_dtype = self.config._pre_quantization_dtype
+            else:
+                target_dtype = self.q_proj.weight.dtype
+            query_states = query_states.to(target_dtype)
+            key_states   = key_states.to(target_dtype)
+            value_states = value_states.to(target_dtype)
+
+        attn_output = _flash_attention_forward(
+            query_states, key_states, value_states, causal_mask, tgt_len,
+            dropout=self.dropout, is_causal=self.is_causal,
+            use_top_left_mask=self._flash_attn_uses_top_left_mask,
+        )
+        attn_output = attn_output.reshape(bsz, tgt_len, -1)
+        attn_output = self.out_proj(attn_output)
+        return attn_output, None, past_key_value
+
+
+class WhisperSdpaAttention(WhisperAttention):
+    def forward(self, hidden_states, key_value_states=None, past_key_value=None,
+                attention_mask=None, layer_head_mask=None, output_attentions=False,
+                cache_position=None):
+        if output_attentions or layer_head_mask is not None:
+            logger.warning_once(
+                "WhisperSdpaAttention does not support output_attentions=True or "
+                "layer_head_mask. Falling back to eager attention."
+            )
+            return super().forward(
+                hidden_states, key_value_states=key_value_states,
+                past_key_value=past_key_value, attention_mask=attention_mask,
+                layer_head_mask=layer_head_mask, output_attentions=output_attentions,
+                cache_position=cache_position,
+            )
+
+        is_cross_attention = key_value_states is not None
+        bsz, tgt_len, _    = hidden_states.size()
+        query_states       = self._shape(self.q_proj(hidden_states), tgt_len, bsz)
+
+        if past_key_value is not None:
+            if isinstance(past_key_value, EncoderDecoderCache):
+                is_updated = past_key_value.is_updated.get(self.layer_idx)
+                if is_cross_attention:
+                    past_key_value.is_updated[self.layer_idx] = True
+                    past_key_value = past_key_value.cross_attention_cache
+                else:
+                    past_key_value = past_key_value.self_attention_cache
+            else:
+                is_updated = False
+
+        current_states = key_value_states if key_value_states is not None else hidden_states
+        if is_cross_attention and past_key_value is not None and is_updated:
+            key_states   = past_key_value.key_cache[self.layer_idx]
+            value_states = past_key_value.value_cache[self.layer_idx]
+        else:
+            key_states   = self._shape(self.k_proj(current_states), -1, bsz)
+            value_states = self._shape(self.v_proj(current_states), -1, bsz)
+            if past_key_value is not None:
+                cache_position = cache_position if not is_cross_attention else None
+                key_states, value_states = past_key_value.update(
+                    key_states, value_states, self.layer_idx, {"cache_position": cache_position}
+                )
+
+        causal_mask = attention_mask
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, :key_states.shape[-2]]
+
+        is_causal   = True if self.is_causal and causal_mask is None and tgt_len > 1 else False
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states, key_states, value_states,
+            attn_mask=causal_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=is_causal,
+        )
+        if attn_output.size() != (bsz, self.num_heads, tgt_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, tgt_len, self.head_dim)}, "
+                f"but is {attn_output.size()}"
+            )
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, tgt_len, self.embed_dim)
+        attn_output = self.out_proj(attn_output)
+        return attn_output, None, past_key_value
+
+
+WHISPER_ATTENTION_CLASSES = {
+    "eager":             WhisperAttention,
+    "flash_attention_2": WhisperFlashAttention2,
+    "sdpa":              WhisperSdpaAttention,
+}
+
+
+
+# Helper: build a LlamaConfig that mirrors Whisper's decoder dimensions
+
+
+def _make_llama_config(whisper_config: WhisperConfig) -> LlamaConfig:
+    """
+    Build a minimal LlamaConfig matching Whisper's decoder dimensions so that
+    the LlamaDecoderLayer hidden size is compatible.
+
+    Notes
+    -----
+    * num_key_value_heads == num_attention_heads  → no GQA, same as Whisper.
+    * intermediate_size   == decoder_ffn_dim      → same FFN width.
+    * _attn_implementation is forwarded so flash/sdpa/eager is consistent.
+    * layer_idx is NOT set here; it is passed to LlamaDecoderLayer.__init__
+      directly so the layer always uses slot 0 in its private DynamicCache.
+    """
+    return LlamaConfig(
+        hidden_size=whisper_config.d_model,
+        intermediate_size=whisper_config.decoder_ffn_dim,
+        num_attention_heads=whisper_config.decoder_attention_heads,
+        num_key_value_heads=whisper_config.decoder_attention_heads,
+        max_position_embeddings=whisper_config.max_target_positions,
+        hidden_act="silu",
+        rms_norm_eps=1e-5,
+        attention_dropout=whisper_config.attention_dropout,
+        _attn_implementation=whisper_config._attn_implementation,
+    )
+
+
+
+# Encoder layer  (unchanged)
+
+
+class WhisperEncoderLayer(nn.Module):
+    def __init__(self, config: WhisperConfig):
+        super().__init__()
+        self.embed_dim            = config.d_model
+        self.self_attn            = WHISPER_ATTENTION_CLASSES[config._attn_implementation](
+            embed_dim=self.embed_dim, num_heads=config.encoder_attention_heads,
+            dropout=config.attention_dropout, config=config,
+        )
+        self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
+        self.dropout              = config.dropout
+        self.activation_fn        = ACT2FN[config.activation_function]
+        self.activation_dropout   = config.activation_dropout
+        self.fc1                  = nn.Linear(self.embed_dim, config.encoder_ffn_dim)
+        self.fc2                  = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
+        self.final_layer_norm     = nn.LayerNorm(self.embed_dim)
+
+    def forward(self, hidden_states, attention_mask, layer_head_mask,
+                output_attentions=False):
+        residual      = hidden_states
+        hidden_states = self.self_attn_layer_norm(hidden_states)
+        hidden_states, attn_weights, _ = self.self_attn(
+            hidden_states=hidden_states, attention_mask=attention_mask,
+            layer_head_mask=layer_head_mask, output_attentions=output_attentions,
+        )
+        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = residual + hidden_states
+
+        residual      = hidden_states
+        hidden_states = self.final_layer_norm(hidden_states)
+        hidden_states = self.activation_fn(self.fc1(hidden_states))
+        hidden_states = nn.functional.dropout(hidden_states, p=self.activation_dropout, training=self.training)
+        hidden_states = self.fc2(hidden_states)
+        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = residual + hidden_states
+
+        if hidden_states.dtype == torch.float16 and (
+            torch.isinf(hidden_states).any() or torch.isnan(hidden_states).any()
+        ):
+            clamp_value   = torch.finfo(hidden_states.dtype).max - 1000
+            hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (attn_weights,)
+        return outputs
+
+
+
+# Decoder layer — Titans MAL with LlamaDecoderLayer
+
+
+class WhisperDecoderLayer(nn.Module):
+    """
+    Whisper decoder layer with Titans MAL extension using LlamaDecoderLayer.
+
+    ALL layers run:
+        [self-attn] → [cross-attn] → [FFN]
+
+    MAL layers (layer_idx >= config.decoder_layers - 1) additionally run ON TOP:
+        → [LlamaDecoderLayer]   (self-attn + RMSNorm + SiLU-FFN, purely additive)
+
+    LlamaDecoderLayer KV cache
+    --------------------------
+    The LlamaDecoderLayer is constructed with layer_idx=0 and uses its own
+    private _mem_attn_cache (a DynamicCache). It NEVER touches the shared
+    EncoderDecoderCache, so there is no slot collision.
+
+    Sliding-window trim
+    -------------------
+    If MAX_MEM_TOKENS is set (module-level constant), _mem_attn_cache is
+    trimmed to the last MAX_MEM_TOKENS tokens before every forward call to
+    prevent unbounded growth.
+
+    Gradient checkpointing safety (FIX 2)
+    --------------------------------------
+    _mem_attn_cache must NOT be mutated inside a checkpointed region.
+    The updated cache is therefore captured in a local variable and assigned
+    to self._mem_attn_cache only after the LlamaDecoderLayer call returns.
+    WhisperDecoder.forward() additionally snapshots the cache state before
+    each checkpointed call and restores it at the top of ckpt_call().
+    """
+
+    def __init__(self, config: WhisperConfig, layer_idx: int = None):
+        super().__init__()
+        self.embed_dim = config.d_model
+        self.layer_idx = layer_idx
+
+        self.self_attn = WHISPER_ATTENTION_CLASSES[config._attn_implementation](
+            embed_dim=self.embed_dim,
+            num_heads=config.decoder_attention_heads,
+            dropout=config.attention_dropout,
+            is_decoder=True,
+            is_causal=True,
+            layer_idx=layer_idx,
+            config=config,
+        )
+        self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
+
+        self.encoder_attn = WHISPER_ATTENTION_CLASSES[config._attn_implementation](
+            embed_dim=self.embed_dim,
+            num_heads=config.decoder_attention_heads,
+            dropout=config.attention_dropout,
+            is_decoder=True,
+            layer_idx=layer_idx,
+            config=config,
+        )
+        self.encoder_attn_layer_norm = nn.LayerNorm(self.embed_dim)
+
+        self.fc1              = nn.Linear(self.embed_dim, config.decoder_ffn_dim)
+        self.fc2              = nn.Linear(config.decoder_ffn_dim, self.embed_dim)
+        self.final_layer_norm = nn.LayerNorm(self.embed_dim)
+
+        self.dropout            = config.dropout
+        self.activation_fn      = ACT2FN[config.activation_function]
+        self.activation_dropout = config.activation_dropout
+
+        
+        self.use_mem = (
+            layer_idx is not None
+            and layer_idx >= config.decoder_layers - 1
+        )
+
+        if self.use_mem:
+            # router gate
+            self.router_gate = nn.Linear(config.d_model, 4*config.d_model, bias=True)
+            self.router_value = nn.Linear(config.d_model, 4*config.d_model, bias=True)
+            self.router_proj = nn.Linear(4*config.d_model, 1, bias=True)
+            
+            # Input norm before the LlamaDecoderLayer
+            self.mem_input_layer_norm = nn.LayerNorm(self.embed_dim)
+
+            # LlamaDecoderLayer — layer_idx=0 so KV always goes to slot 0
+            # of the private _mem_attn_cache, never the shared cache.
+            llama_cfg = _make_llama_config(config)
+            self.llama_mem_layer = LlamaDecoderLayer(llama_cfg, layer_idx=0)
+
+            # Private KV cache — persists across decode steps, reset per utterance
+            self._mem_attn_cache: Optional[DynamicCache] = None
+
+
+
+    def reset_mem_cache(self) -> None:
+        """Drop the private KV cache. Called by WhisperDecoder.reset_mem_states()."""
+        self._mem_attn_cache = None
+
+
+
+    def _trim_mem_cache(self) -> None:
+        """
+        Trim _mem_attn_cache to the last MAX_MEM_TOKENS tokens (sliding window).
+        No-op if MAX_MEM_TOKENS is None or cache is short enough.
+        """
+        if MAX_MEM_TOKENS is None:
+            return
+        cache = self._mem_attn_cache
+        if cache is None:
+            return
+        seq_len = cache.get_seq_length()
+        if seq_len <= MAX_MEM_TOKENS:
+            return
+        for i in range(len(cache.key_cache)):
+            cache.key_cache[i]   = cache.key_cache[i][:, :, -MAX_MEM_TOKENS:, :]
+            cache.value_cache[i] = cache.value_cache[i][:, :, -MAX_MEM_TOKENS:, :]
+
+
+    def forward(
+        self,
+        hidden_states:              torch.Tensor,
+        attention_mask:             Optional[torch.Tensor]        = None,
+        encoder_hidden_states:      Optional[torch.Tensor]        = None,
+        encoder_attention_mask:     Optional[torch.Tensor]        = None,
+        layer_head_mask:            Optional[torch.Tensor]        = None,
+        cross_attn_layer_head_mask: Optional[torch.Tensor]        = None,
+        past_key_value:             Optional[EncoderDecoderCache] = None,
+        output_attentions:          Optional[bool]                = False,
+        use_cache:                  Optional[bool]                = True,
+        cache_position:             Optional[torch.LongTensor]    = None,
+        mem_state:                  Optional[MemoryState]         = None,
+        lang_embed:                 Optional[torch.Tensor]        = None,
+    ) -> Tuple:
+        """
+        Returns
+        -------
+        (hidden_states,
+         [self_attn_weights, cross_attn_weights],   # only if output_attentions
+         [present_key_value],                        # only if use_cache
+         new_mem_state)                              # ALWAYS last; None for non-MAL
+        """
+
+   
+        residual      = hidden_states
+        hidden_states = self.self_attn_layer_norm(hidden_states)
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            past_key_value=past_key_value,
+            attention_mask=attention_mask,
+            layer_head_mask=layer_head_mask,
+            output_attentions=output_attentions,
+            cache_position=cache_position,
+        )
+        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = residual + hidden_states
+
+    
+        cross_attn_weights = None
+        if encoder_hidden_states is not None:
+            residual      = hidden_states
+            hidden_states = self.encoder_attn_layer_norm(hidden_states)
+            hidden_states, cross_attn_weights, cross_attn_pkv = self.encoder_attn(
+                hidden_states=hidden_states,
+                key_value_states=encoder_hidden_states,
+                attention_mask=encoder_attention_mask,
+                layer_head_mask=cross_attn_layer_head_mask,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+            )
+            hidden_states     = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+            hidden_states     = residual + hidden_states
+            present_key_value = (present_key_value, cross_attn_pkv)
+
+      
+        residual      = hidden_states
+        hidden_states = self.final_layer_norm(hidden_states)
+        hidden_states = self.activation_fn(self.fc1(hidden_states))
+        hidden_states = nn.functional.dropout(hidden_states, p=self.activation_dropout, training=self.training)
+        hidden_states = self.fc2(hidden_states)
+        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = residual + hidden_states
+
+   
+        new_mem_state: Optional[MemoryState] = None
+
+        if self.use_mem:
+            # Initialise private cache on first step
+            if self._mem_attn_cache is None:
+                self._mem_attn_cache = DynamicCache()
+
+            # Optional sliding-window trim to cap memory usage
+            self._trim_mem_cache()
+
+            # Snapshot before the call (FIX 2a — grad-ckpt safety)
+            cache_in = self._mem_attn_cache
+
+            # Pre-norm before LlamaDecoderLayer
+            residual     = hidden_states
+            normed_input = self.mem_input_layer_norm(hidden_states)
+
+            # Build position_ids for RoPE — LLaMA requires them.
+            # cache_in already holds tokens from previous steps; its length
+            # tells us the offset for the current token(s).
+            bsz, seq_len, _ = normed_input.shape
+            past_mem_len    = cache_in.get_seq_length()
+
+            if cache_position is not None:
+                # Prefer the explicit cache_position supplied by the decoder
+                llama_position_ids = cache_position.unsqueeze(0).expand(bsz, -1)
+            else:
+                llama_position_ids = torch.arange(
+                    past_mem_len,
+                    past_mem_len + seq_len,
+                    device=hidden_states.device,
+                ).unsqueeze(0).expand(bsz, -1)
+
+            # LlamaDecoderLayer signature:
+            #   (hidden_states, attention_mask, position_ids,
+            #    past_key_value, output_attentions, use_cache, cache_position)
+            #
+            # We pass attention_mask=None because the LlamaDecoderLayer
+            # builds its own causal mask internally from position_ids.
+            llama_out = self.llama_mem_layer(
+                hidden_states=normed_input,
+                attention_mask=None,        # LLaMA builds its own causal mask
+                position_ids=llama_position_ids,
+                past_key_value=cache_in,    # private DynamicCache, slot 0
+                output_attentions=output_attentions,
+                use_cache=True,
+                cache_position=cache_position,
+            )
+
+            # llama_out: (hidden_states, [self_attn_weights], [present_kv])
+            mem_out = llama_out[0]
+
+            # Extract updated DynamicCache — it is the last tuple element
+            # that is a Cache instance.
+            updated_cache = next(
+                (x for x in reversed(llama_out) if isinstance(x, DynamicCache)),
+                cache_in,   # fallback: unchanged cache (should not happen)
+            )
+
+            # Write updated cache AFTER the call (FIX 2a)
+            self._mem_attn_cache = updated_cache
+
+            mem_out       = nn.functional.dropout(mem_out, p=self.dropout, training=self.training)
+
+            # Router gate — decide how much of the mem output to use
+            gate_input    = self.router_gate(residual)
+            gate_value    = self.router_value(residual)
+            router_score  = self.router_proj(torch.sigmoid(gate_input) * (gate_value))
+            router_weight = torch.sigmoid(router_score)
+            # Additive residual: mem output on top of the FFN output
+            hidden_states = residual + router_weight * mem_out
+
+            if output_attentions:
+                # Expose LLaMA self-attn weights if available
+                llama_attn = next(
+                    (x for x in llama_out[1:] if isinstance(x, torch.Tensor)
+                     and x.ndim == 4),
+                    None,
+                )
+                if llama_attn is not None:
+                    self_attn_weights = llama_attn
+
+        # Build output tuple 
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (self_attn_weights, cross_attn_weights)
+
+        if use_cache:
+            outputs += (present_key_value,)
+
+        outputs += (new_mem_state,)     # None for non-MAL layers; always last
+
+        return outputs
+
+
+
+# WhisperPreTrainedModel base
+class WhisperPreTrainedModel(PreTrainedModel):
+    config_class                    = WhisperConfig
+    base_model_prefix               = "model"
+    main_input_name                 = "input_features"
+    supports_gradient_checkpointing = True
+    _no_split_modules               = ["WhisperEncoderLayer", "WhisperDecoderLayer"]
+    _supports_flash_attn_2          = True
+    _supports_sdpa                  = True
+    _supports_cache_class           = True
+    _supports_static_cache          = True
+
+    def _init_weights(self, module):
+        std = self.config.init_std
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, WhisperEncoder):
+            with torch.no_grad():
+                embed_positions = module.embed_positions.weight
+                embed_positions.copy_(sinusoids(*embed_positions.shape))
+
+    def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
+        return (input_lengths - 1) // 2 + 1
+
+
+
+# Encoder
+class WhisperEncoder(WhisperPreTrainedModel):
+    def __init__(self, config: WhisperConfig):
+        super().__init__(config)
+        self.dropout              = config.dropout
+        self.layerdrop            = config.encoder_layerdrop
+        embed_dim                 = config.d_model
+        self.num_mel_bins         = config.num_mel_bins
+        self.padding_idx          = config.pad_token_id
+        self.max_source_positions = config.max_source_positions
+        self.embed_scale          = math.sqrt(embed_dim) if config.scale_embedding else 1.0
+        self.conv1                = nn.Conv1d(self.num_mel_bins, embed_dim, kernel_size=3, padding=1)
+        self.conv2                = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1)
+        self.embed_positions      = nn.Embedding(self.max_source_positions, embed_dim)
+        self.embed_positions.requires_grad_(False)
+        self.layers               = nn.ModuleList(
+            [WhisperEncoderLayer(config) for _ in range(config.encoder_layers)]
+        )
+        self.layer_norm             = nn.LayerNorm(config.d_model)
+        self.gradient_checkpointing = False
+        self.post_init()
+
+    def _freeze_parameters(self):
+        for param in self.parameters():
+            param.requires_grad = False
+        self._requires_grad = False
+
+    def get_input_embeddings(self):    return self.conv1
+    def set_input_embeddings(self, v): self.conv1 = v
+
+    def forward(self, input_features, attention_mask=None, head_mask=None,
+                output_attentions=None, output_hidden_states=None, return_dict=None):
+        expected_seq_length = (
+            self.config.max_source_positions
+            * self.conv1.stride[0]
+            * self.conv2.stride[0]
+        )
+        if input_features.shape[-1] != expected_seq_length:
+            raise ValueError(
+                f"Whisper expects mel input of length {expected_seq_length}, "
+                f"but got {input_features.shape[-1]}."
+            )
+        output_attentions    = output_attentions    if output_attentions    is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        return_dict          = return_dict          if return_dict          is not None else self.config.use_return_dict
+
+        inputs_embeds = nn.functional.gelu(self.conv1(input_features))
+        inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
+        inputs_embeds = inputs_embeds.permute(0, 2, 1)
+        embed_pos     = self.embed_positions.weight
+        hidden_states = inputs_embeds + embed_pos
+        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+
+        encoder_states = () if output_hidden_states else None
+        all_attentions = () if output_attentions    else None
+
+        if head_mask is not None:
+            assert head_mask.size()[0] == len(self.layers), (
+                f"head_mask should be specified for {len(self.layers)} layers, "
+                f"but got {head_mask.size()[0]}."
+            )
+
+        for idx, encoder_layer in enumerate(self.layers):
+            if output_hidden_states:
+                encoder_states = encoder_states + (hidden_states,)
+            to_drop = False
+            if self.training:
+                dropout_probability = torch.rand([])
+                if dropout_probability < self.layerdrop:
+                    to_drop = True
+            if to_drop:
+                layer_outputs = (None, None)
+            else:
+                if self.gradient_checkpointing and self.training:
+                    layer_outputs = self._gradient_checkpointing_func(
+                        encoder_layer.__call__, hidden_states, None,
+                        head_mask[idx] if head_mask is not None else None,
+                        output_attentions,
+                    )
+                else:
+                    layer_outputs = encoder_layer(
+                        hidden_states, None,
+                        layer_head_mask=head_mask[idx] if head_mask is not None else None,
+                        output_attentions=output_attentions,
+                    )
+                hidden_states = layer_outputs[0]
+            if output_attentions:
+                all_attentions = all_attentions + (layer_outputs[1],)
+
+        hidden_states = self.layer_norm(hidden_states)
+        if output_hidden_states:
+            encoder_states = encoder_states + (hidden_states,)
+
+        if not return_dict:
+            return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
+        return BaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=encoder_states,
+            attentions=all_attentions,
+        )
+
+
+
+# Decoder
+class WhisperDecoder(WhisperPreTrainedModel):
+    """
+    Whisper decoder with persistent Titans long-term memory.
+
+    mem_states : dict[layer_idx -> MemoryState]
+        Populated on first decode step; updated every step.
+        Must be reset between utterances via reset_mem_states().
+
+    _mem_attn_cache on each MAL WhisperDecoderLayer:
+        Private DynamicCache fed into LlamaDecoderLayer.
+        Also reset between utterances via reset_mem_states().
+
+    Gradient checkpointing safety (FIX 2b)
+    ----------------------------------------
+    make_ckpt_call() snapshots _mem_attn_cache before the checkpointed
+    call and restores it inside ckpt_call() so the recomputation during
+    backprop always sees the same cache state as the original forward pass.
+    """
+
+    main_input_name = "input_ids"
+
+    def __init__(self, config: WhisperConfig):
+        super().__init__(config)
+        self.dropout              = config.dropout
+        self.layerdrop            = config.decoder_layerdrop
+        self.padding_idx          = config.pad_token_id
+        self.max_target_positions = config.max_target_positions
+        self.max_source_positions = config.max_source_positions
+        self.embed_scale          = math.sqrt(config.d_model) if config.scale_embedding else 1.0
+        self.embed_tokens         = nn.Embedding(config.vocab_size, config.d_model, self.padding_idx)
+        self.embed_positions      = WhisperPositionalEmbedding(
+            self.max_target_positions, config.d_model
+        )
+        self.layers = nn.ModuleList([
+            WhisperDecoderLayer(config, layer_idx=i)
+            for i in range(config.decoder_layers)
+        ])
+        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
+        self._use_sdpa              = config._attn_implementation == "sdpa"
+        self.layer_norm             = nn.LayerNorm(config.d_model)
+        self.gradient_checkpointing = False
+
+        # Titans memory state per MAL layer
+        self.mem_states: dict[int, MemoryState] = {}
+        self.lang_embed = None
+
+        self.post_init()
+
+    # -----------------------------------------------------------------------
+
+    def reset_mem_states(self) -> None:
+        """
+        Reset ALL transient decode state between utterances:
+          - LMMBlock MemoryState for every MAL layer
+          - Private _mem_attn_cache (fed to LlamaDecoderLayer) for every MAL layer
+        Call this at the START of every new utterance.
+        """
+        self.mem_states = {}
+        for layer in self.layers:
+            if layer.use_mem:
+                layer.reset_mem_cache()
+
+    def get_input_embeddings(self):    return self.embed_tokens
+    def set_input_embeddings(self, v): self.embed_tokens = v
+
+    # -----------------------------------------------------------------------
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        encoder_hidden_states=None,
+        head_mask=None,
+        cross_attn_head_mask=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        position_ids=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        cache_position=None,
+    ):
+        output_attentions    = output_attentions    if output_attentions    is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        use_cache            = use_cache            if use_cache            is not None else self.config.use_cache
+        return_dict          = return_dict          if return_dict          is not None else self.config.use_return_dict
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("Specify either decoder_input_ids or decoder_inputs_embeds, not both.")
+        elif input_ids is not None:
+            input_shape = input_ids.size()
+            input_ids   = input_ids.view(-1, input_shape[-1])
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.size()[:-1]
+        else:
+            raise ValueError("Specify either decoder_input_ids or decoder_inputs_embeds.")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if input_shape[1] > 1:
+            self.lang_embed = inputs_embeds[:, 1, :]
+
+        return_legacy_cache         = False
+        return_self_attention_cache = False
+        if use_cache or past_key_values is not None:
+            if isinstance(past_key_values, Cache) and not isinstance(past_key_values, EncoderDecoderCache):
+                return_self_attention_cache = True
+                past_key_values = EncoderDecoderCache(past_key_values, DynamicCache())
+            elif not isinstance(past_key_values, EncoderDecoderCache):
+                return_legacy_cache = True
+                past_key_values = EncoderDecoderCache.from_legacy_cache(past_key_values)
+
+        past_key_values_length = 0
+        if cache_position is not None:
+            past_key_values_length = cache_position[0]
+        elif past_key_values is not None:
+            past_key_values_length = past_key_values.get_seq_length()
+
+        if cache_position is None:
+            cache_position = torch.arange(
+                past_key_values_length,
+                past_key_values_length + input_shape[1],
+                device=inputs_embeds.device,
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        src_for_pos = input_ids if input_ids is not None else inputs_embeds
+        positions   = self.embed_positions(
+            src_for_pos,
+            past_key_values_length=past_key_values_length,
+            position_ids=position_ids,
+        )
+        hidden_states = inputs_embeds + positions.to(inputs_embeds.device)
+        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+
+        causal_mask = self._update_causal_mask(
+            attention_mask, inputs_embeds, cache_position,
+            past_key_values.self_attention_cache if past_key_values is not None else None,
+            output_attentions,
+        )
+
+        if self.gradient_checkpointing and self.training and use_cache:
+            logger.warning_once(
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+            )
+            use_cache = False
+
+        all_hidden_states    = () if output_hidden_states else None
+        all_self_attns       = () if output_attentions    else None
+        all_cross_attentions = () if (output_attentions and encoder_hidden_states is not None) else None
+
+        for idx, decoder_layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            if self.training:
+                dropout_probability = torch.rand([])
+                if dropout_probability < self.layerdrop:
+                    continue
+
+            current_mem_state = self.mem_states.get(idx, None)
+
+            if self.gradient_checkpointing and self.training:
+                _lang_embed = self.lang_embed
+
+                def make_ckpt_call(layer, lang_embed):
+                    # FIX 2b: snapshot _mem_attn_cache BEFORE the checkpointed
+                    # call. ckpt_call() restores this snapshot at the start so
+                    # that the recomputation during backprop sees the identical
+                    # cache state as the original forward pass, preventing the
+                    # shape-doubling CheckpointError.
+                    saved_mem_cache = (
+                        layer._mem_attn_cache if layer.use_mem else None
+                    )
+
+                    def ckpt_call(
+                        hidden_states, causal_mask, encoder_hidden_states,
+                        _u1, layer_head_mask, cross_attn_layer_head_mask,
+                        _u2, output_attentions, use_cache,
+                        cache_position, mem_state,
+                    ):
+                        # Restore cache snapshot so recompute == original forward
+                        if layer.use_mem:
+                            layer._mem_attn_cache = saved_mem_cache
+
+                        return layer(
+                            hidden_states,
+                            attention_mask=causal_mask,
+                            encoder_hidden_states=encoder_hidden_states,
+                            layer_head_mask=layer_head_mask,
+                            cross_attn_layer_head_mask=cross_attn_layer_head_mask,
+                            past_key_value=None,
+                            output_attentions=output_attentions,
+                            use_cache=use_cache,
+                            cache_position=cache_position,
+                            mem_state=mem_state,
+                            lang_embed=lang_embed,
+                        )
+                    return ckpt_call
+
+                layer_outputs = self._gradient_checkpointing_func(
+                    make_ckpt_call(decoder_layer, _lang_embed),
+                    hidden_states,
+                    causal_mask,
+                    encoder_hidden_states,
+                    None,
+                    head_mask[idx]            if head_mask            is not None else None,
+                    cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None,
+                    None,
+                    output_attentions,
+                    use_cache,
+                    cache_position,
+                    current_mem_state,
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    encoder_hidden_states=encoder_hidden_states,
+                    layer_head_mask=(
+                        head_mask[idx] if head_mask is not None else None
+                    ),
+                    cross_attn_layer_head_mask=(
+                        cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
+                    ),
+                    past_key_value=past_key_values if use_cache else None,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    mem_state=current_mem_state,
+                    lang_embed=self.lang_embed,
+                )
+
+            hidden_states = layer_outputs[0]
+
+            # new_mem_state is always the last element
+            new_mem_state: Optional[MemoryState] = layer_outputs[-1]
+            if new_mem_state is not None:
+                self.mem_states[idx] = new_mem_state
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+                if encoder_hidden_states is not None:
+                    all_cross_attentions += (layer_outputs[2],)
+
+        hidden_states = self.layer_norm(hidden_states)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        next_cache = past_key_values if use_cache else None
+        if return_self_attention_cache:
+            next_cache = past_key_values.self_attention_cache
+        if return_legacy_cache:
+            next_cache = past_key_values.to_legacy_cache()
+
+        if not return_dict:
+            return tuple(
+                v for v in [hidden_states, next_cache, all_hidden_states,
+                             all_self_attns, all_cross_attentions]
+                if v is not None
+            )
+        return BaseModelOutputWithPastAndCrossAttentions(
+            last_hidden_state=hidden_states,
+            past_key_values=next_cache,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+            cross_attentions=all_cross_attentions,
+        )
+
+    # -----------------------------------------------------------------------
+
+    def _update_causal_mask(
+        self, attention_mask, input_tensor, cache_position, past_key_values, output_attentions
+    ):
+        if self.config._attn_implementation == "flash_attention_2":
+            if attention_mask is not None and 0.0 in attention_mask:
+                return attention_mask
+            return None
+
+        past_seen_tokens   = past_key_values.get_seq_length() if past_key_values is not None else 0
+        using_static_cache = isinstance(past_key_values, StaticCache)
+
+        if (
+            self.config._attn_implementation == "sdpa"
+            and not using_static_cache
+            and not output_attentions
+        ):
+            if AttentionMaskConverter._ignore_causal_mask_sdpa(
+                attention_mask, inputs_embeds=input_tensor,
+                past_key_values_length=past_seen_tokens, is_training=self.training,
+            ):
+                return None
+
+        dtype, device   = input_tensor.dtype, input_tensor.device
+        min_dtype       = torch.finfo(dtype).min
+        sequence_length = input_tensor.shape[1]
+
+        if using_static_cache:
+            target_length = past_key_values.get_max_length()
+        else:
+            target_length = (
+                attention_mask.shape[-1]
+                if isinstance(attention_mask, torch.Tensor)
+                else past_seen_tokens + sequence_length + 1
+            )
+
+        if attention_mask is not None and attention_mask.dim() == 4:
+            if attention_mask.max() != 0:
+                raise ValueError("Custom 4D attention mask must be in inverted form with max==0.")
+            causal_mask = attention_mask
+        else:
+            causal_mask = torch.full(
+                (sequence_length, target_length), fill_value=min_dtype,
+                dtype=dtype, device=device,
+            )
+            if sequence_length != 1:
+                causal_mask = torch.triu(causal_mask, diagonal=1)
+            causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
+            causal_mask  = causal_mask[None, None, :, :].expand(input_tensor.shape[0], 1, -1, -1)
+            if attention_mask is not None:
+                causal_mask  = causal_mask.clone()
+                mask_length  = attention_mask.shape[-1]
+                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
+                padding_mask = padding_mask == 0
+                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
+                    padding_mask, min_dtype
+                )
+
+        if (
+            self.config._attn_implementation == "sdpa"
+            and attention_mask is not None
+            and attention_mask.device.type == "cuda"
+            and not output_attentions
+        ):
+            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
+
+        return causal_mask
+
+
+
+# WhisperModel
+class WhisperModel(WhisperPreTrainedModel):
+    def __init__(self, config: WhisperConfig):
+        super().__init__(config)
+        self.encoder = WhisperEncoder(config)
+        self.decoder = WhisperDecoder(config)
+        self.post_init()
+
+    def get_input_embeddings(self):    return self.decoder.embed_tokens
+    def set_input_embeddings(self, v): self.decoder.embed_tokens = v
+    def get_encoder(self):             return self.encoder
+    def get_decoder(self):             return self.decoder
+    def freeze_encoder(self):          self.encoder._freeze_parameters()
+
+    def _mask_input_features(self, input_features, attention_mask=None):
+        if not getattr(self.config, "apply_spec_augment", True):
+            return input_features
+        batch_size, hidden_size, sequence_length = input_features.size()
+        if self.config.mask_time_prob > 0 and self.training:
+            mask_time_indices = _compute_mask_indices(
+                (batch_size, sequence_length),
+                mask_prob=self.config.mask_time_prob,
+                mask_length=self.config.mask_time_length,
+                attention_mask=attention_mask,
+                min_masks=self.config.mask_time_min_masks,
+            )
+            mask_time_indices = torch.tensor(
+                mask_time_indices, device=input_features.device, dtype=torch.bool
+            )
+            mask_time_indices = mask_time_indices[:, None].expand(-1, hidden_size, -1)
+            input_features[mask_time_indices] = 0
+        if self.config.mask_feature_prob > 0 and self.training:
+            mask_feature_indices = _compute_mask_indices(
+                (batch_size, hidden_size),
+                mask_prob=self.config.mask_feature_prob,
+                mask_length=self.config.mask_feature_length,
+                min_masks=self.config.mask_feature_min_masks,
+            )
+            mask_feature_indices = torch.tensor(
+                mask_feature_indices, device=input_features.device, dtype=torch.bool
+            )
+            input_features[mask_feature_indices] = 0
+        return input_features
+
+    def forward(
+        self,
+        input_features=None, attention_mask=None, decoder_input_ids=None,
+        decoder_attention_mask=None, head_mask=None, decoder_head_mask=None,
+        cross_attn_head_mask=None, encoder_outputs=None, past_key_values=None,
+        decoder_inputs_embeds=None, decoder_position_ids=None,
+        use_cache=None, output_attentions=None, output_hidden_states=None,
+        return_dict=None, cache_position=None,
+    ):
+        output_attentions    = output_attentions    if output_attentions    is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        use_cache            = use_cache            if use_cache            is not None else self.config.use_cache
+        return_dict          = return_dict          if return_dict          is not None else self.config.use_return_dict
+
+        if encoder_outputs is None:
+            input_features  = self._mask_input_features(input_features, attention_mask=attention_mask)
+            encoder_outputs = self.encoder(
+                input_features, head_mask=head_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+        elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
+            encoder_outputs = BaseModelOutput(
+                last_hidden_state=encoder_outputs[0],
+                hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
+                attentions=encoder_outputs[2]     if len(encoder_outputs) > 2 else None,
+            )
+
+        decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            encoder_hidden_states=encoder_outputs[0],
+            head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=decoder_inputs_embeds,
+            position_ids=decoder_position_ids,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+        )
+
+        if not return_dict:
+            return decoder_outputs + encoder_outputs
+
+        return Seq2SeqModelOutput(
+            last_hidden_state=decoder_outputs.last_hidden_state,
+            past_key_values=decoder_outputs.past_key_values,
+            decoder_hidden_states=decoder_outputs.hidden_states,
+            decoder_attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
+        )
+
+
+
+# WhisperForConditionalGeneration
+class WhisperForConditionalGeneration(WhisperGenerationMixin, WhisperPreTrainedModel):
+    base_model_prefix  = "model"
+    _tied_weights_keys = ["proj_out.weight"]
+
+    def __init__(self, config: WhisperConfig):
+        super().__init__(config)
+        self.model    = WhisperModel(config)
+        self.proj_out = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.post_init()
+
+    def get_encoder(self):              return self.model.get_encoder()
+    def get_decoder(self):              return self.model.get_decoder()
+    def get_output_embeddings(self):    return self.proj_out
+    def set_output_embeddings(self, e): self.proj_out = e
+    def get_input_embeddings(self):     return self.model.get_input_embeddings()
+    def freeze_encoder(self):           self.model.encoder._freeze_parameters()
+
+    def forward(
+        self,
+        input_features=None, attention_mask=None,
+        decoder_input_ids=None, decoder_attention_mask=None,
+        head_mask=None, decoder_head_mask=None, cross_attn_head_mask=None,
+        encoder_outputs=None, past_key_values=None,
+        decoder_inputs_embeds=None, decoder_position_ids=None,
+        labels=None, use_cache=None,
+        output_attentions=None, output_hidden_states=None,
+        return_dict=None, cache_position=None,
+    ):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if labels is not None:
+            if decoder_input_ids is None and decoder_inputs_embeds is None:
+                decoder_input_ids = shift_tokens_right(
+                    labels, self.config.pad_token_id, self.config.decoder_start_token_id
+                )
+
+        # Reset Titans memory at the start of every new utterance.
+        is_new_utterance = (
+            past_key_values is None
+            or (cache_position is not None and int(cache_position[0]) == 0)
+        )
+        if is_new_utterance:
+            self.model.decoder.reset_mem_states()
+
+        outputs = self.model(
+            input_features,
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            encoder_outputs=encoder_outputs,
+            decoder_attention_mask=decoder_attention_mask,
+            head_mask=head_mask,
+            decoder_head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            past_key_values=past_key_values,
+            decoder_inputs_embeds=decoder_inputs_embeds,
+            decoder_position_ids=decoder_position_ids,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+        )
+
+        lm_logits = self.proj_out(outputs[0])
+        loss      = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            labels   = labels.to(lm_logits.device)
+            loss     = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.reshape(-1))
+
+        if not return_dict:
+            output = (lm_logits,) + outputs[1:]
+            return ((loss,) + output) if loss is not None else output
+
+        return Seq2SeqLMOutput(
+            loss=loss,
+            logits=lm_logits,
+            past_key_values=outputs.past_key_values,
+            decoder_hidden_states=outputs.decoder_hidden_states,
+            decoder_attentions=outputs.decoder_attentions,
+            cross_attentions=outputs.cross_attentions,
+            encoder_last_hidden_state=outputs.encoder_last_hidden_state,
+            encoder_hidden_states=outputs.encoder_hidden_states,
+            encoder_attentions=outputs.encoder_attentions,
+        )
+
+    def prepare_inputs_for_generation(
+        self, decoder_input_ids, past_key_values=None, use_cache=None,
+        encoder_outputs=None, attention_mask=None, decoder_attention_mask=None,
+        cache_position=None, **kwargs,
+    ):
+        decoder_position_ids = None
+        if decoder_attention_mask is not None:
+            decoder_position_ids = (decoder_attention_mask.cumsum(-1) - 1).clamp(min=0)
+
+        past_length = 0
+        if past_key_values is not None:
+            if isinstance(past_key_values, EncoderDecoderCache):
+                past_length = (
+                    cache_position[0] if cache_position is not None
+                    else past_key_values.get_seq_length()
+                )
+            else:
+                past_length = past_key_values[0][0].shape[2]
+
+            if decoder_input_ids.shape[1] > past_length:
+                remove_prefix_length = past_length
+            else:
+                remove_prefix_length = decoder_input_ids.shape[1] - 1
+
+            decoder_input_ids = decoder_input_ids[:, remove_prefix_length:]
+            if (decoder_position_ids is not None
+                    and decoder_position_ids.shape[1] > decoder_input_ids.shape[1]):
+                decoder_position_ids = decoder_position_ids[:, remove_prefix_length:]
+
+        if cache_position is None:
+            cache_position = torch.arange(
+                past_length, past_length + decoder_input_ids.shape[1],
+                device=decoder_input_ids.device,
+            )
+        elif use_cache:
+            cache_position = cache_position[-decoder_input_ids.shape[1]:]
+
+        return {
+            "encoder_outputs":        encoder_outputs,
+            "past_key_values":        past_key_values,
+            "decoder_input_ids":      decoder_input_ids,
+            "use_cache":              use_cache,
+            "decoder_attention_mask": decoder_attention_mask,
+            "decoder_position_ids":   decoder_position_ids,
+            "cache_position":         cache_position,
+        }
+
+
+
+# Remaining wrappers (unchanged)
+class WhisperDecoderWrapper(WhisperPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        config.is_encoder_decoder = False
+        self.decoder = WhisperDecoder(config)
+
+    def get_input_embeddings(self):     return self.decoder.embed_tokens
+    def set_input_embeddings(self, v):  self.decoder.embed_tokens = v
+    def forward(self, *args, **kwargs): return self.decoder(*args, **kwargs)
